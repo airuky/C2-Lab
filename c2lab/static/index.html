@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="localhost 上の別プロセス Node と固定タスクだけを扱う C2 学習ラボ"
+    />
+    <title>C2 Lab — Local Process Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">メインコンテンツへ</a>
+
+    <div class="simulation-banner" role="note" aria-label="localhost 学習環境の注意">
+      <div class="simulation-banner__inner">
+        <span class="simulation-banner__pulse" aria-hidden="true"></span>
+        <strong>LOCALHOST LAB</strong>
+        <span class="simulation-banner__slash" aria-hidden="true">/</span>
+        <strong>REAL PROCESS NODE</strong>
+        <span class="simulation-banner__note">LOOPBACK ONLY · LAB-BOUND PLAYBOOKS</span>
+      </div>
+    </div>
+
+    <header class="app-header">
+      <div class="app-header__inner">
+        <a class="brand" href="#main-content" aria-label="C2 Lab ホーム">
+          <span class="brand__mark" aria-hidden="true"><span>C2</span></span>
+          <span class="brand__copy">
+            <strong>C2 Lab</strong>
+            <small>Local Process Console</small>
+          </span>
+        </a>
+
+        <div class="header-actions">
+          <div class="api-state" id="apiState" data-state="idle" role="status" aria-live="polite">
+            <span class="api-state__dot" aria-hidden="true"></span>
+            <span id="apiStateText">接続待ち</span>
+          </div>
+          <button class="button button--quiet button--compact" id="refreshButton" type="button">
+            <span aria-hidden="true">↻</span>
+            <span>更新</span>
+          </button>
+          <button class="button button--danger-ghost button--compact" id="resetButton" type="button">
+            リセット
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <nav class="section-nav" aria-label="コンソール内ナビゲーション">
+      <div class="section-nav__inner">
+        <a href="#overview">概要</a>
+        <a href="#nodes">Node</a>
+        <a href="#dispatch">送信</a>
+        <a href="#tasks">結果</a>
+        <a href="#events">履歴</a>
+      </div>
+    </nav>
+
+    <main id="main-content" class="shell">
+      <section class="intro" aria-labelledby="page-title">
+        <div class="intro__copy">
+          <p class="eyebrow"><span aria-hidden="true">01</span> LOCAL CONTROL PLANE</p>
+          <h1 id="page-title">別プロセスの流れを、<br /><span>localhost だけで学ぶ。</span></h1>
+          <p>
+            Teamserver と foreground Node を分離し、登録、poll、dispatch、result の流れを観察します。
+            Node が実行できるのはprofileで固定された許可タスクと、purple_labのNode-private playbookだけです。
+          </p>
+          <div class="mode-strip" aria-label="ラボ情報">
+            <span><small>MODE</small><strong id="labModeValue">LOCALHOST LAB</strong></span>
+            <span><small>PROTOCOL</small><strong id="protocolValue">loopback-http-poll/v1</strong></span>
+          </div>
+        </div>
+
+        <details class="auth-card" id="tokenManagement" open>
+          <summary class="auth-card__heading">
+            <span class="auth-card__index" aria-hidden="true">OPERATOR</span>
+            <div>
+              <h2>Teamserver 接続とtoken管理</h2>
+              <p>Operator token はこのタブ内だけに保存されます。選択すると管理欄を開閉できます。</p>
+            </div>
+          </summary>
+          <form class="auth-card__form" id="tokenForm">
+            <label class="field" for="tokenInput">
+              <span class="field__label">Bearer token</span>
+              <span class="token-field">
+                <input
+                  id="tokenInput"
+                  name="token"
+                  type="password"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="operator token を入力"
+                />
+                <button
+                  class="icon-button"
+                  id="tokenVisibilityButton"
+                  type="button"
+                  aria-label="トークンを表示"
+                  aria-pressed="false"
+                >
+                  表示
+                </button>
+              </span>
+            </label>
+            <div class="auth-card__actions">
+              <button class="button button--primary" id="connectButton" type="submit">接続する</button>
+              <button class="button button--quiet" id="clearTokenButton" type="button">消去</button>
+            </div>
+            <p class="auth-card__hint">
+              Teamserver が表示する <code>#token=...</code> 付きURLを開くと自動で読み込み、URLから削除します。
+            </p>
+          </form>
+        </details>
+      </section>
+
+      <section class="overview-section section-anchor" id="overview" aria-labelledby="overview-title">
+        <div class="section-heading section-heading--rule">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">02</span> LIVE OVERVIEW</p>
+            <h2 id="overview-title">プロセス概要</h2>
+          </div>
+          <p id="lastUpdated">未取得</p>
+        </div>
+
+        <div class="metric-grid" aria-live="polite" aria-busy="false" id="metricGrid">
+          <button class="metric metric--accent metric-button" type="button" data-section-target="nodes" aria-controls="nodes">
+            <div class="metric__top"><span>ONLINE NODES</span><span class="metric__glyph" aria-hidden="true">●</span></div>
+            <strong id="metricNodesOnline">—</strong>
+            <p><span id="metricNodesTotal">—</span> プロセス登録済み</p>
+          </button>
+          <button class="metric metric-button" type="button" data-task-status="queued" aria-controls="tasks" aria-pressed="false">
+            <div class="metric__top"><span>QUEUED</span><span class="metric__glyph" aria-hidden="true">◇</span></div>
+            <strong id="metricTasksQueued">—</strong>
+            <p>次の poll を待機</p>
+          </button>
+          <button class="metric metric--active metric-button" type="button" data-task-status="dispatched" aria-controls="tasks" aria-pressed="false">
+            <div class="metric__top"><span>DISPATCHED</span><span class="metric__glyph" aria-hidden="true">↗</span></div>
+            <strong id="metricTasksActive">—</strong>
+            <p>Node が処理中</p>
+          </button>
+          <button class="metric metric--success metric-button" type="button" data-task-status="completed" aria-controls="tasks" aria-pressed="false">
+            <div class="metric__top"><span>COMPLETED</span><span class="metric__glyph" aria-hidden="true">✓</span></div>
+            <strong id="metricTasksCompleted">—</strong>
+            <p>正常に結果を受信</p>
+          </button>
+          <button class="metric metric--danger metric-button" type="button" data-task-status="failed" aria-controls="tasks" aria-pressed="false">
+            <div class="metric__top"><span>FAILED</span><span class="metric__glyph" aria-hidden="true">×</span></div>
+            <strong id="metricTasksFailed">—</strong>
+            <p>安全に失敗終了</p>
+          </button>
+          <button class="metric metric--warning metric-button" type="button" data-task-status="timeout" aria-controls="tasks" aria-pressed="false">
+            <div class="metric__top"><span>TIMEOUT</span><span class="metric__glyph" aria-hidden="true">!</span></div>
+            <strong id="metricTasksTimeout">—</strong>
+            <p>期限内に応答なし</p>
+          </button>
+        </div>
+      </section>
+
+      <details class="panel startup-panel" id="startupPanel" open>
+        <summary class="panel__header">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">03</span> START THE LAB</p>
+            <h2 id="startup-title">2つのターミナルで起動</h2>
+          </div>
+          <span class="localhost-tag">127.0.0.1 ONLY</span>
+        </summary>
+        <div class="startup-steps">
+          <article class="startup-step">
+            <span class="startup-step__number">01</span>
+            <div>
+              <strong>Teamserver を起動</strong>
+              <p>Operator URL と Node enrollment token が表示されます。</p>
+              <code class="command-code">python3 -m c2lab teamserver</code>
+            </div>
+          </article>
+          <article class="startup-step">
+            <span class="startup-step__number">02</span>
+            <div>
+              <strong>別ターミナルで Node を起動</strong>
+              <p>表示された enrollment token はプロンプトへ入力します。</p>
+              <code class="command-code">python3 -m c2lab node --name node-a</code>
+            </div>
+          </article>
+          <article class="startup-step startup-step--observe">
+            <span class="startup-step__number">03</span>
+            <div>
+              <strong>登録と poll を観察</strong>
+              <p>Node は foreground で動作します。停止はそのターミナルで <kbd>Ctrl</kbd> + <kbd>C</kbd> です。</p>
+              <span class="safe-line">NO SHELL · EPHEMERAL LAB FILES ONLY · NO REMOTE TRANSPORT</span>
+            </div>
+          </article>
+        </div>
+      </details>
+
+      <section class="workspace" aria-label="Node とタスク操作">
+        <article class="panel panel--nodes section-anchor" id="nodes" aria-labelledby="nodes-title">
+          <div class="panel__header">
+            <div>
+              <p class="eyebrow"><span aria-hidden="true">04</span> PROCESS REGISTRY</p>
+              <h2 id="nodes-title">登録済み Node</h2>
+            </div>
+            <span class="count-badge" id="nodeCountBadge">0 NODES</span>
+          </div>
+          <div class="node-list" id="nodeList" aria-busy="false"></div>
+          <div class="empty-state" id="nodesEmpty">
+            <span class="empty-state__mark" aria-hidden="true">·</span>
+            <strong>Node の check-in を待っています</strong>
+            <p>上の手順で別プロセス Node を起動してください。</p>
+          </div>
+        </article>
+
+        <article class="panel panel--task-create section-anchor" id="dispatch" aria-labelledby="create-task-title">
+          <div class="panel__header">
+            <div>
+              <p class="eyebrow"><span aria-hidden="true">05</span> FIXED DISPATCH</p>
+              <h2 id="create-task-title">許可タスクを送信</h2>
+            </div>
+            <span class="allowlist-tag">PROFILE ALLOWLIST</span>
+          </div>
+
+          <div class="selected-node-summary" id="selectedNodeSummary" data-state="empty" aria-live="polite">
+            <div class="selected-node-summary__identity">
+              <span>SELECTED NODE</span>
+              <strong id="selectedNodeName">Node 未選択</strong>
+            </div>
+            <div class="selected-node-summary__facts">
+              <span><small>STATUS</small><strong id="selectedNodeStatus">—</strong></span>
+              <span><small>CAPABILITY PROFILE</small><strong id="selectedNodeProfile">—</strong></span>
+              <span><small>SESSION</small><strong id="selectedNodeSession">—</strong></span>
+            </div>
+            <p id="selectedNodeCapabilities">登録済みNodeを選択すると、実行可能な固定タスクを確認できます。</p>
+          </div>
+
+          <form class="task-form" id="taskForm">
+            <label class="field" for="taskNodeSelect">
+              <span class="field__label">送信先 Node</span>
+              <select id="taskNodeSelect" name="node_id" required>
+                <option value="">Node を選択</option>
+              </select>
+            </label>
+            <label class="field" for="taskTypeSelect">
+              <span class="field__label">タスク種別</span>
+              <select id="taskTypeSelect" name="type" required>
+                <option value="PING">PING</option>
+                <option value="RUNTIME_STATUS">RUNTIME_STATUS</option>
+                <option value="ECHO_TEXT">ECHO_TEXT</option>
+                <option value="HASH_TEXT">HASH_TEXT</option>
+                <option value="WAIT">WAIT</option>
+                <option value="GENERATE_EVENT">GENERATE_EVENT</option>
+                <option value="RUN_PLAYBOOK">RUN_PLAYBOOK</option>
+              </select>
+            </label>
+            <label class="field" id="playbookField" for="playbookSelect" hidden>
+              <span class="field__label">固定 Purple Lab Playbook</span>
+              <select id="playbookSelect" name="playbook">
+                <option value="DISCOVERY_FIXTURES">DISCOVERY_FIXTURES</option>
+                <option value="COLLECT_AND_STAGE">COLLECT_AND_STAGE</option>
+                <option value="CREATE_CANARY">CREATE_CANARY</option>
+                <option value="CLEANUP">CLEANUP</option>
+              </select>
+            </label>
+            <label class="field" id="taskPayloadField" for="taskPayloadInput">
+              <span class="field__label field__label--split">
+                <span>Payload (JSON)</span>
+                <button class="text-button" id="restoreTemplateButton" type="button">テンプレートに戻す</button>
+              </span>
+              <textarea
+                id="taskPayloadInput"
+                name="payload"
+                rows="7"
+                required
+                spellcheck="false"
+                aria-describedby="payloadHint payloadError"
+              >{}</textarea>
+            </label>
+            <div class="payload-meta">
+              <p id="payloadHint">Node との疎通を確認します。payload は空オブジェクトです。</p>
+              <p class="field-error" id="payloadError" role="alert"></p>
+            </div>
+            <button class="button button--primary button--full" id="createTaskButton" type="submit">
+              許可タスクをキューへ送信 <span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </article>
+      </section>
+
+      <section class="panel panel--tasks section-anchor" id="tasks" aria-labelledby="tasks-title">
+        <div class="panel__header panel__header--responsive">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">06</span> CORRELATED TASKS</p>
+            <h2 id="tasks-title">タスクと結果</h2>
+          </div>
+          <div class="panel-tools">
+            <span class="count-badge" id="taskCountBadge">0 TASKS</span>
+            <label class="search-control" for="taskSearchInput">
+              <span class="visually-hidden">タスクを検索</span>
+              <input id="taskSearchInput" type="search" placeholder="ID / correlation / type / Node" autocomplete="off" />
+            </label>
+            <label class="filter-control" for="taskStatusFilter">
+              <span>状態</span>
+              <select id="taskStatusFilter">
+                <option value="all">すべて</option>
+                <option value="queued">QUEUED</option>
+                <option value="dispatched">DISPATCHED</option>
+                <option value="completed">COMPLETED</option>
+                <option value="failed">FAILED</option>
+                <option value="timeout">TIMEOUT</option>
+                <option value="cancelled">CANCELLED</option>
+                <option value="expired">EXPIRED</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="task-table">
+            <thead>
+              <tr>
+                <th scope="col">TASK ID</th>
+                <th scope="col">CORRELATION</th>
+                <th scope="col">TYPE</th>
+                <th scope="col">NODE</th>
+                <th scope="col">STATUS</th>
+                <th scope="col">CREATED</th>
+                <th scope="col"><span class="visually-hidden">詳細</span></th>
+              </tr>
+            </thead>
+            <tbody id="taskTableBody"></tbody>
+          </table>
+        </div>
+        <div class="empty-state empty-state--wide" id="tasksEmpty">
+          <span class="empty-state__mark" aria-hidden="true">◇</span>
+          <strong id="tasksEmptyTitle">表示できるタスクがありません</strong>
+          <p id="tasksEmptyDescription">登録済み Node を選び、許可タスクを送信してください。</p>
+        </div>
+      </section>
+
+      <section class="panel panel--events section-anchor" id="events" aria-labelledby="events-title">
+        <div class="panel__header panel__header--responsive">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">07</span> CONTROL-PLANE HISTORY</p>
+            <h2 id="events-title">イベントと監査</h2>
+          </div>
+          <div class="panel-tools">
+            <span class="count-badge" id="eventCountBadge">0 EVENTS</span>
+            <label class="filter-control" for="activitySourceFilter">
+              <span>VIEW</span>
+              <select id="activitySourceFilter">
+                <option value="events">EVENTS</option>
+                <option value="audit">AUDIT</option>
+              </select>
+            </label>
+            <label class="search-control" for="eventSearchInput">
+              <span class="visually-hidden">イベントまたは監査を検索</span>
+              <input id="eventSearchInput" type="search" placeholder="kind / action / actor / ID" autocomplete="off" />
+            </label>
+            <label class="filter-control" for="eventLevelFilter">
+              <span>LEVEL</span>
+              <select id="eventLevelFilter">
+                <option value="all">すべて</option>
+                <option value="info">INFO</option>
+                <option value="warning">WARNING</option>
+                <option value="error">ERROR</option>
+              </select>
+            </label>
+            <label class="filter-control" for="eventActorFilter">
+              <span>ACTOR</span>
+              <select id="eventActorFilter">
+                <option value="all">すべて</option>
+              </select>
+            </label>
+            <div class="live-label"><span aria-hidden="true"></span> 3秒ごとに自動更新</div>
+          </div>
+        </div>
+        <div class="event-list" id="eventList" aria-busy="false"></div>
+        <div class="empty-state empty-state--wide" id="eventsEmpty">
+          <span class="empty-state__mark" aria-hidden="true">·</span>
+          <strong id="eventsEmptyTitle">履歴を待機中</strong>
+          <p id="eventsEmptyDescription">運用イベントまたはredacted監査台帳がここに表示されます。</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer__inner">
+        <div>
+          <strong>C2 LAB / LOCALHOST PROCESS LEARNING ONLY</strong>
+          <p>実プロセス Node は loopback とNode専用の一時workspaceだけを使用し、固定playbookを実行します。</p>
+        </div>
+        <span>NO SHELL · NO HOST FILES · NO REMOTE C2</span>
+      </div>
+    </footer>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+    <dialog class="detail-dialog" id="taskDetailDialog" aria-labelledby="taskDetailTitle">
+      <div class="detail-dialog__header">
+        <div>
+          <span class="allowlist-tag">FIXED TASK</span>
+          <h2 id="taskDetailTitle">タスク詳細</h2>
+        </div>
+        <button class="icon-button icon-button--close" id="closeTaskDetailButton" type="button" aria-label="閉じる">×</button>
+      </div>
+      <div class="detail-dialog__body" id="taskDetailBody"></div>
+    </dialog>
+  </body>
+</html>

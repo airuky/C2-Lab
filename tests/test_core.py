@@ -1,0 +1,734 @@
+from __future__ import annotations
+
+import json
+import unittest
+
+from c2lab.core import (
+    DEFAULT_QUEUE_TTL_SECONDS,
+    MAX_AUDIT_ENTRIES,
+    MAX_QUEUE_TTL_SECONDS,
+    MAX_NODES,
+    MAX_QUEUED_PLAYBOOKS_PER_NODE,
+    MAX_QUEUED_TASKS_PER_NODE,
+    MAX_TASKS,
+    NODE_STALE_SECONDS,
+    MIN_QUEUE_TTL_SECONDS,
+    STALE_SESSION_TTL_SECONDS,
+    TASK_TIMEOUT_SECONDS,
+    LabError,
+    LabState,
+)
+from c2lab.protocol import capabilities_for_profile
+
+
+class LabStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = LabState()
+        enrollment = self.state.enroll_node(
+            "unit-node",
+            "0.2.0",
+            "training",
+            capabilities_for_profile("training"),
+            1_000,
+            now=10.0,
+        )
+        self.node = enrollment["node"]
+        self.session_token = enrollment["session_token"]
+
+    def test_enrollment_returns_private_session_separately(self) -> None:
+        self.assertTrue(self.state.authenticate_node(self.node["id"], self.session_token))
+        self.assertFalse(self.state.authenticate_node(self.node["id"], "wrong-token"))
+        self.assertNotIn("session_token", self.node)
+        self.assertNotIn("_session_token", self.state.nodes()[0])
+        self.assertTrue(self.node["session_active"])
+        self.assertEqual(self.node["transport"], "loopback-http-poll/v1")
+
+    def test_allowlisted_task_moves_through_node_lifecycle(self) -> None:
+        queued = self.state.queue_task(self.node["id"], "PING", {})
+
+        polled = self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+        self.assertEqual(polled["task"]["id"], queued["id"])
+        self.assertEqual(polled["task"]["status"], "dispatched")
+
+        finished = self.state.submit_result(
+            self.node["id"],
+            self.session_token,
+            queued["id"],
+            "completed",
+            {"reply": "PONG"},
+            now=11.1,
+        )
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["result"], {"reply": "PONG"})
+        self.assertTrue(finished["correlation_id"].startswith("corr-"))
+        self.assertEqual(self.state.nodes()[0]["tasks_completed"], 1)
+
+    def test_identical_result_retry_is_idempotent(self) -> None:
+        task = self.state.queue_task(self.node["id"], "PING", {})
+        self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+        first = self.state.submit_result(
+            self.node["id"], self.session_token, task["id"], "completed", {"reply": "PONG"}, now=11.1
+        )
+        replay = self.state.submit_result(
+            self.node["id"], self.session_token, task["id"], "completed", {"reply": "PONG"}, now=11.2
+        )
+
+        self.assertEqual(replay, first)
+        self.assertEqual(self.state.nodes()[0]["tasks_completed"], 1)
+        completed_events = [event for event in self.state.events() if event["kind"] == "task.completed"]
+        self.assertEqual(len(completed_events), 1)
+        with self.assertRaises(LabError) as context:
+            self.state.submit_result(
+                self.node["id"], self.session_token, task["id"], "failed", {"error": "different"}, now=11.3
+            )
+        self.assertEqual(context.exception.code, "result_conflict")
+
+    def test_task_creation_idempotency_prevents_duplicate_queue_entries(self) -> None:
+        key = "operator-request-0001"
+        first = self.state.queue_task(
+            self.node["id"],
+            "ECHO_TEXT",
+            {"text": "idempotent"},
+            idempotency_key=key,
+            queue_ttl_seconds=60,
+            now=20.0,
+        )
+        replay = self.state.queue_task(
+            self.node["id"],
+            "ECHO_TEXT",
+            {"text": "idempotent"},
+            idempotency_key=key,
+            queue_ttl_seconds=60,
+            now=21.0,
+        )
+
+        self.assertEqual(replay, first)
+        self.assertEqual(len(self.state.tasks()), 1)
+        self.assertNotIn("idempotency_key", first)
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(
+                self.node["id"],
+                "ECHO_TEXT",
+                {"text": "different"},
+                idempotency_key=key,
+                queue_ttl_seconds=60,
+                now=22.0,
+            )
+        self.assertEqual(context.exception.status, 409)
+        self.assertEqual(context.exception.code, "idempotency_conflict")
+
+    def test_queued_task_expires_but_dispatched_task_does_not(self) -> None:
+        queued = self.state.queue_task(
+            self.node["id"],
+            "PING",
+            {},
+            queue_ttl_seconds=MIN_QUEUE_TTL_SECONDS,
+            now=20.0,
+        )
+        self.state.expire(now=20.0 + MIN_QUEUE_TTL_SECONDS)
+        expired = next(task for task in self.state.tasks() if task["id"] == queued["id"])
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["result"], {"reason": "queue_ttl_exceeded"})
+        self.assertIn("task.expired", [event["kind"] for event in self.state.events()])
+        self.assertEqual(self.state.overview()["counts"]["tasks_expired"], 1)
+
+        dispatched = self.state.queue_task(
+            self.node["id"],
+            "PING",
+            {},
+            queue_ttl_seconds=MIN_QUEUE_TTL_SECONDS,
+            now=30.0,
+        )
+        self.state.poll_node(self.node["id"], self.session_token, now=31.0)
+        self.state.expire(now=30.0 + MIN_QUEUE_TTL_SECONDS)
+        retained = next(task for task in self.state.tasks() if task["id"] == dispatched["id"])
+        self.assertEqual(retained["status"], "dispatched")
+
+    def test_queued_task_cancellation_is_idempotent_and_never_dispatches(self) -> None:
+        queued = self.state.queue_task(self.node["id"], "PING", {}, now=20.0)
+        cancelled = self.state.cancel_task(queued["id"])
+        replayed = self.state.cancel_task(queued["id"])
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["result"], {"reason": "operator_cancelled"})
+        self.assertEqual(replayed, cancelled)
+        self.assertEqual(self.state.overview()["counts"]["tasks_cancelled"], 1)
+        self.assertIsNone(self.state.poll_node(self.node["id"], self.session_token, now=21.0)["task"])
+        self.assertEqual(
+            len([event for event in self.state.events() if event["kind"] == "task.cancelled"]),
+            1,
+        )
+
+        active = self.state.queue_task(self.node["id"], "PING", {}, now=22.0)
+        self.state.poll_node(self.node["id"], self.session_token, now=22.1)
+        with self.assertRaises(LabError) as context:
+            self.state.cancel_task(active["id"])
+        self.assertEqual(context.exception.code, "task_not_cancellable")
+
+    def test_queue_controls_validate_bounds_and_default(self) -> None:
+        defaulted = self.state.queue_task(self.node["id"], "PING", {}, now=20.0)
+        self.assertEqual(defaulted["queue_ttl_seconds"], DEFAULT_QUEUE_TTL_SECONDS)
+
+        for invalid_ttl in (
+            None,
+            True,
+            MIN_QUEUE_TTL_SECONDS - 1,
+            MAX_QUEUE_TTL_SECONDS + 1,
+            "60",
+        ):
+            with self.subTest(queue_ttl_seconds=invalid_ttl), self.assertRaises(LabError):
+                self.state.queue_task(
+                    self.node["id"],
+                    "PING",
+                    {},
+                    queue_ttl_seconds=invalid_ttl,
+                    now=20.0,
+                )
+        for invalid_key in ("short", "contains space", 123):
+            with self.subTest(idempotency_key=invalid_key), self.assertRaises(LabError):
+                self.state.queue_task(
+                    self.node["id"],
+                    "PING",
+                    {},
+                    idempotency_key=invalid_key,
+                    now=20.0,
+                )
+
+    def test_only_one_task_is_dispatched_per_node(self) -> None:
+        first = self.state.queue_task(self.node["id"], "PING", {})
+        second = self.state.queue_task(self.node["id"], "RUNTIME_STATUS", {})
+
+        first_poll = self.state.poll_node(self.node["id"], self.session_token, now=12.0)
+        second_poll = self.state.poll_node(self.node["id"], self.session_token, now=12.1)
+
+        self.assertEqual(first_poll["task"]["id"], first["id"])
+        self.assertEqual(second_poll["task"]["id"], first["id"])
+        self.assertEqual(second_poll["task"]["delivery_attempts"], 2)
+        statuses = {task["id"]: task["status"] for task in self.state.tasks()}
+        self.assertEqual(statuses[first["id"]], "dispatched")
+        self.assertEqual(statuses[second["id"]], "queued")
+
+    def test_second_task_dispatches_after_first_result(self) -> None:
+        first = self.state.queue_task(self.node["id"], "PING", {})
+        second = self.state.queue_task(self.node["id"], "ECHO_TEXT", {"text": "hello"})
+        self.state.poll_node(self.node["id"], self.session_token, now=13.0)
+        self.state.submit_result(
+            self.node["id"], self.session_token, first["id"], "completed", {"reply": "PONG"}, now=13.1
+        )
+
+        polled = self.state.poll_node(self.node["id"], self.session_token, now=13.2)
+        self.assertEqual(polled["task"]["id"], second["id"])
+
+    def test_invalid_node_session_is_rejected(self) -> None:
+        with self.assertRaises(LabError) as context:
+            self.state.poll_node(self.node["id"], "not-the-session-token", now=14.0)
+        self.assertEqual(context.exception.status, 401)
+        self.assertEqual(context.exception.code, "invalid_node_session")
+
+    def test_profile_capabilities_are_enforced(self) -> None:
+        enrollment = self.state.enroll_node(
+            "basic-node",
+            "0.2.0",
+            "basic",
+            capabilities_for_profile("basic"),
+            1_000,
+            now=20.0,
+        )
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(enrollment["node"]["id"], "WAIT", {"milliseconds": 5})
+        self.assertEqual(context.exception.status, 409)
+        self.assertEqual(context.exception.code, "capability_denied")
+
+        with self.assertRaises(LabError) as playbook_context:
+            self.state.queue_task(
+                self.node["id"],
+                "RUN_PLAYBOOK",
+                {"playbook": "DISCOVERY_FIXTURES"},
+            )
+        self.assertEqual(playbook_context.exception.code, "capability_denied")
+
+    def test_purple_lab_profile_accepts_only_fixed_playbooks(self) -> None:
+        enrollment = self.state.enroll_node(
+            "purple-node",
+            "0.3.0",
+            "purple_lab",
+            capabilities_for_profile("purple_lab"),
+            1_000,
+            now=20.0,
+        )
+        task = self.state.queue_task(
+            enrollment["node"]["id"],
+            "RUN_PLAYBOOK",
+            {"playbook": "DISCOVERY_FIXTURES"},
+        )
+        self.assertEqual(task["payload"], {"playbook": "DISCOVERY_FIXTURES"})
+
+        for invalid_payload in (
+            {"playbook": "CUSTOM"},
+            {"playbook": "DISCOVERY_FIXTURES", "path": "/tmp"},
+            {"playbook": ["DISCOVERY_FIXTURES"]},
+        ):
+            with self.subTest(payload=invalid_payload), self.assertRaises(LabError):
+                self.state.queue_task(
+                    enrollment["node"]["id"],
+                    "RUN_PLAYBOOK",
+                    invalid_payload,
+                )
+
+    def test_purple_lab_queue_has_a_smaller_bound(self) -> None:
+        enrollment = self.state.enroll_node(
+            "purple-queue-node",
+            "0.3.0",
+            "purple_lab",
+            capabilities_for_profile("purple_lab"),
+            1_000,
+            now=20.0,
+        )
+        for _ in range(MAX_QUEUED_PLAYBOOKS_PER_NODE):
+            self.state.queue_task(
+                enrollment["node"]["id"],
+                "RUN_PLAYBOOK",
+                {"playbook": "DISCOVERY_FIXTURES"},
+            )
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(
+                enrollment["node"]["id"],
+                "RUN_PLAYBOOK",
+                {"playbook": "DISCOVERY_FIXTURES"},
+            )
+        self.assertEqual(context.exception.status, 429)
+        self.assertEqual(context.exception.code, "playbook_queue_limit")
+
+    def test_unknown_task_type_is_rejected(self) -> None:
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(self.node["id"], "RUN_COMMAND", {"command": "whoami"})
+        self.assertEqual(context.exception.code, "unsupported_task_type")
+
+    def test_payload_schema_and_bounds_are_strict(self) -> None:
+        invalid_tasks = (
+            ("PING", {"unexpected": True}),
+            ("ECHO_TEXT", {"text": "ok", "extra": 1}),
+            ("WAIT", {"milliseconds": 2_001}),
+            ("GENERATE_EVENT", {"category": "training", "severity": "critical", "message": "x"}),
+            ("GENERATE_EVENT", {"category": [], "severity": "info", "message": "x"}),
+            ("GENERATE_EVENT", {"category": "training", "severity": {}, "message": "x"}),
+            ("RUN_PLAYBOOK", {"playbook": "CUSTOM"}),
+        )
+        for task_type, payload in invalid_tasks:
+            with self.subTest(task_type=task_type, payload=payload), self.assertRaises(LabError):
+                self.state.queue_task(self.node["id"], task_type, payload)
+
+    def test_result_status_type_is_rejected_without_internal_error(self) -> None:
+        task = self.state.queue_task(self.node["id"], "PING", {})
+        self.state.poll_node(self.node["id"], self.session_token, now=15.0)
+        with self.assertRaises(LabError):
+            self.state.submit_result(
+                self.node["id"], self.session_token, task["id"], ["completed"], {"reply": "PONG"}, now=15.1
+            )
+
+    def test_generated_event_is_centrally_recorded(self) -> None:
+        task = self.state.queue_task(
+            self.node["id"],
+            "GENERATE_EVENT",
+            {"category": "training", "severity": "warning", "message": "demo alert"},
+        )
+        self.state.poll_node(self.node["id"], self.session_token, now=30.0)
+        self.state.submit_result(
+            self.node["id"],
+            self.session_token,
+            task["id"],
+            "completed",
+            {
+                "recorded": True,
+                "category": "training",
+                "severity": "warning",
+                "message": "demo alert",
+            },
+            now=30.1,
+        )
+
+        event = next(event for event in self.state.events() if event["kind"] == "node.generated_event")
+        self.assertEqual(event["node_id"], self.node["id"])
+        self.assertEqual(event["task_id"], task["id"])
+        self.assertEqual(event["level"], "warning")
+
+    def test_task_specific_result_schema_rejects_forged_node_output(self) -> None:
+        task = self.state.queue_task(self.node["id"], "ECHO_TEXT", {"text": "expected"})
+        self.state.poll_node(self.node["id"], self.session_token, now=30.0)
+
+        for status, result in (
+            ("completed", {"echo": "host-derived-value"}),
+            ("completed", {"echo": "expected", "path": "/Users/example"}),
+            ("failed", {"error_code": "CUSTOM_ERROR"}),
+            ("failed", {"error": "arbitrary node text"}),
+        ):
+            with self.subTest(status=status, result=result), self.assertRaises(LabError):
+                self.state.submit_result(
+                    self.node["id"],
+                    self.session_token,
+                    task["id"],
+                    status,
+                    result,
+                    now=30.1,
+                )
+
+        accepted = self.state.submit_result(
+            self.node["id"],
+            self.session_token,
+            task["id"],
+            "failed",
+            {"error_code": "HANDLER_FAILED"},
+            now=30.2,
+        )
+        self.assertEqual(accepted["result"], {"error_code": "HANDLER_FAILED"})
+        rejected_events = [
+            event for event in self.state.events() if event["kind"] == "task.result_rejected"
+        ]
+        self.assertEqual(len(rejected_events), 4)
+        serialized = json.dumps({"events": rejected_events, "audit": self.state.audit()})
+        self.assertNotIn("host-derived-value", serialized)
+        self.assertNotIn("/Users/example", serialized)
+
+    def test_event_sequences_are_monotonic_and_correlation_is_top_level(self) -> None:
+        task = self.state.queue_task(self.node["id"], "PING", {})
+        self.state.poll_node(self.node["id"], self.session_token, now=31.0)
+
+        chronological = list(reversed(self.state.events()))
+        sequences = [event["sequence"] for event in chronological]
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(sequences), len(set(sequences)))
+        queued_event = next(event for event in chronological if event["kind"] == "task.queued")
+        self.assertEqual(queued_event["correlation_id"], task["correlation_id"])
+        self.assertEqual(queued_event["data"]["correlation_id"], task["correlation_id"])
+
+        last_sequence = sequences[-1]
+        self.state.reset()
+        self.assertGreater(self.state.events()[0]["sequence"], last_sequence)
+
+    def test_audit_and_report_are_bounded_structured_and_redacted(self) -> None:
+        marker = "do-not-copy-this-payload"
+        task = self.state.queue_task(self.node["id"], "ECHO_TEXT", {"text": marker})
+        self.state.poll_node(self.node["id"], self.session_token, now=32.0)
+        self.state.submit_result(
+            self.node["id"], self.session_token, task["id"], "completed", {"echo": marker}, now=32.1
+        )
+
+        expected_fields = {
+            "id",
+            "sequence",
+            "time",
+            "actor",
+            "action",
+            "node_id",
+            "task_id",
+            "correlation_id",
+            "task_type",
+            "from_state",
+            "to_state",
+            "outcome",
+            "reason",
+        }
+        audit = self.state.audit()
+        self.assertTrue({"node.enrolled", "task.queued", "task.dispatched", "task.completed"}.issubset(
+            {entry["action"] for entry in audit}
+        ))
+        self.assertTrue(all(set(entry) == expected_fields for entry in audit))
+        audit_json = json.dumps(audit)
+        self.assertNotIn(marker, audit_json)
+        self.assertNotIn(self.session_token, audit_json)
+
+        report = self.state.report()
+        report_json = json.dumps(report)
+        self.assertNotIn(marker, report_json)
+        self.assertNotIn(self.session_token, report_json)
+        report_task = next(item for item in report["tasks"] if item["id"] == task["id"])
+        self.assertNotIn("payload", report_task)
+        self.assertNotIn("result", report_task)
+        self.assertEqual(report_task["correlation_id"], task["correlation_id"])
+
+        self.state.reset()
+        self.assertIn("task.completed", {entry["action"] for entry in self.state.audit()})
+        for _ in range(MAX_AUDIT_ENTRIES + 5):
+            self.state.reset()
+        bounded = self.state.audit()
+        self.assertEqual(len(bounded), MAX_AUDIT_ENTRIES)
+        self.assertEqual(bounded[0]["sequence"], self.state.report()["sequences"]["audit"])
+
+    def test_dispatched_task_times_out_and_rejects_late_result(self) -> None:
+        task = self.state.queue_task(self.node["id"], "PING", {})
+        self.state.poll_node(self.node["id"], self.session_token, now=40.0)
+
+        self.state.expire(now=40.0 + TASK_TIMEOUT_SECONDS)
+        timed_out = next(item for item in self.state.tasks() if item["id"] == task["id"])
+        self.assertEqual(timed_out["status"], "timeout")
+        self.assertEqual(self.state.nodes()[0]["tasks_failed"], 1)
+        with self.assertRaises(LabError) as context:
+            self.state.submit_result(
+                self.node["id"], self.session_token, task["id"], "completed", {"reply": "late"}, now=50.0
+            )
+        self.assertEqual(context.exception.status, 409)
+
+    def test_node_becomes_stale_and_poll_recovers_it(self) -> None:
+        self.state.expire(now=10.0 + NODE_STALE_SECONDS)
+        self.assertEqual(self.state.nodes()[0]["status"], "offline")
+
+        recovered = self.state.poll_node(self.node["id"], self.session_token, now=19.0)
+        self.assertEqual(recovered["node"]["status"], "online")
+        self.assertIn("node.online", [event["kind"] for event in self.state.events()])
+        lifecycle_audit = {
+            entry["action"]: entry
+            for entry in self.state.audit()
+            if entry["action"] in {"node.stale", "node.online"}
+        }
+        self.assertEqual(lifecycle_audit["node.stale"]["from_state"], "online")
+        self.assertEqual(lifecycle_audit["node.stale"]["to_state"], "offline")
+        self.assertEqual(lifecycle_audit["node.online"]["from_state"], "offline")
+        self.assertEqual(lifecycle_audit["node.online"]["to_state"], "online")
+
+    def test_stale_session_expires_after_ttl_and_fails_queued_tasks(self) -> None:
+        queued = [
+            self.state.queue_task(self.node["id"], "PING", {}),
+            self.state.queue_task(self.node["id"], "ECHO_TEXT", {"text": "expire-me"}),
+        ]
+        stale_at = 10.0 + NODE_STALE_SECONDS
+        self.state.expire(now=stale_at)
+        stale_node = self.state.nodes()[0]
+        self.assertEqual(stale_node["status"], "offline")
+        self.assertTrue(stale_node["session_active"])
+
+        self.state.expire(now=stale_at + STALE_SESSION_TTL_SECONDS - 0.001)
+        self.assertTrue(self.state.nodes()[0]["session_active"])
+        self.assertTrue(all(task["status"] == "queued" for task in self.state.tasks()))
+
+        self.state.expire(now=stale_at + STALE_SESSION_TTL_SECONDS)
+        expired_node = self.state.nodes()[0]
+        self.assertEqual(expired_node["status"], "offline")
+        self.assertFalse(expired_node["session_active"])
+        self.assertEqual(expired_node["tasks_failed"], len(queued))
+        self.assertFalse(self.state.authenticate_node(self.node["id"], self.session_token))
+
+        tasks = {task["id"]: task for task in self.state.tasks()}
+        for task in queued:
+            self.assertEqual(tasks[task["id"]]["status"], "failed")
+            self.assertEqual(
+                tasks[task["id"]]["result"],
+                {"error": "node session expired before task completion"},
+            )
+
+        self.assertIn("node.session_expired", [event["kind"] for event in self.state.events()])
+        session_audit = next(
+            entry for entry in self.state.audit() if entry["action"] == "node.session_expired"
+        )
+        self.assertEqual(session_audit["from_state"], "offline")
+        self.assertEqual(session_audit["to_state"], "offline")
+        self.assertEqual(session_audit["reason"], "offline_session_ttl_exceeded")
+        task_audit = [
+            entry
+            for entry in self.state.audit()
+            if entry["action"] == "task.failed" and entry["reason"] == "node_session_expired"
+        ]
+        self.assertEqual(
+            {entry["task_id"] for entry in task_audit},
+            {task["id"] for task in queued},
+        )
+
+    def test_expired_stale_sessions_release_node_capacity(self) -> None:
+        state = LabState()
+        original_ids = set()
+        for index in range(MAX_NODES):
+            enrollment = state.enroll_node(
+                f"stale-node-{index}",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+                now=0.0,
+            )
+            original_ids.add(enrollment["node"]["id"])
+
+        state.expire(now=NODE_STALE_SECONDS + STALE_SESSION_TTL_SECONDS)
+        self.assertTrue(all(not node["session_active"] for node in state.nodes()))
+
+        replacement = state.enroll_node(
+            "replacement-after-expiry",
+            "0.2.0",
+            "basic",
+            capabilities_for_profile("basic"),
+            1_000,
+            now=NODE_STALE_SECONDS + STALE_SESSION_TTL_SECONDS + 1.0,
+        )
+        retained_ids = {node["id"] for node in state.nodes()}
+        self.assertEqual(len(retained_ids), MAX_NODES)
+        self.assertIn(replacement["node"]["id"], retained_ids)
+        self.assertEqual(len(original_ids - retained_ids), 1)
+        self.assertIn("node.pruned", [event["kind"] for event in state.events()])
+
+    def test_disconnect_marks_node_offline(self) -> None:
+        queued = self.state.queue_task(self.node["id"], "PING", {})
+        disconnected = self.state.disconnect_node(self.node["id"], self.session_token)
+        self.assertEqual(disconnected["status"], "offline")
+        self.assertFalse(disconnected["session_active"])
+        self.assertFalse(self.state.authenticate_node(self.node["id"], self.session_token))
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(self.node["id"], "PING", {})
+        self.assertEqual(context.exception.code, "node_disconnected")
+        task = next(item for item in self.state.tasks() if item["id"] == queued["id"])
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["result"]["error"], "node session closed before task completion")
+
+    def test_reset_invalidates_node_sessions(self) -> None:
+        self.state.queue_task(self.node["id"], "PING", {})
+        self.state.reset()
+
+        overview = self.state.overview()
+        self.assertEqual(overview["nodes"], [])
+        self.assertEqual(overview["tasks"], [])
+        self.assertEqual([event["kind"] for event in overview["events"]], ["lab.reset"])
+        self.assertFalse(self.state.authenticate_node(self.node["id"], self.session_token))
+
+    def test_node_limit_is_enforced(self) -> None:
+        state = LabState()
+        for index in range(MAX_NODES):
+            state.enroll_node(
+                f"limit-node-{index}",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+            )
+        with self.assertRaises(LabError) as context:
+            state.enroll_node(
+                "one-node-too-many",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+            )
+        self.assertEqual(context.exception.code, "node_limit")
+
+    def test_oldest_closed_node_record_is_pruned_at_limit(self) -> None:
+        state = LabState()
+        first_id = None
+        for index in range(MAX_NODES):
+            enrollment = state.enroll_node(
+                f"closed-node-{index}",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+                now=float(index),
+            )
+            if first_id is None:
+                first_id = enrollment["node"]["id"]
+            state.disconnect_node(enrollment["node"]["id"], enrollment["session_token"])
+
+        replacement = state.enroll_node(
+            "replacement-node",
+            "0.2.0",
+            "basic",
+            capabilities_for_profile("basic"),
+            1_000,
+            now=100.0,
+        )
+        node_ids = {node["id"] for node in state.nodes()}
+        self.assertEqual(len(node_ids), MAX_NODES)
+        self.assertNotIn(first_id, node_ids)
+        self.assertIn(replacement["node"]["id"], node_ids)
+        self.assertIn("node.pruned", [event["kind"] for event in state.events()])
+
+    def test_per_node_and_total_task_limits_are_enforced(self) -> None:
+        state = LabState()
+        for index in range(MAX_TASKS // MAX_QUEUED_TASKS_PER_NODE):
+            enrollment = state.enroll_node(
+                f"queue-node-{index}",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+            )
+            for _ in range(MAX_QUEUED_TASKS_PER_NODE):
+                state.queue_task(enrollment["node"]["id"], "PING", {})
+
+        self.assertEqual(len(state.tasks()), MAX_TASKS)
+        overflow_node = state.enroll_node(
+            "overflow-node",
+            "0.2.0",
+            "basic",
+            capabilities_for_profile("basic"),
+            1_000,
+        )["node"]
+        task_ids = {task["id"] for task in state.tasks()}
+        with self.assertRaises(LabError) as context:
+            state.queue_task(overflow_node["id"], "PING", {})
+        self.assertEqual(context.exception.code, "task_limit")
+        self.assertEqual({task["id"] for task in state.tasks()}, task_ids)
+        self.assertNotIn("task.pruned", [event["kind"] for event in state.events()])
+
+    def test_oldest_terminal_task_is_pruned_at_total_limit(self) -> None:
+        state = LabState()
+        enrollments = [
+            state.enroll_node(
+                f"retention-node-{index}",
+                "0.2.0",
+                "basic",
+                capabilities_for_profile("basic"),
+                1_000,
+                now=0.0,
+            )
+            for index in range(MAX_TASKS // MAX_QUEUED_TASKS_PER_NODE)
+        ]
+        first_node = enrollments[0]
+        oldest_terminal = state.queue_task(first_node["node"]["id"], "PING", {})
+        state.poll_node(first_node["node"]["id"], first_node["session_token"], now=1.0)
+        state.submit_result(
+            first_node["node"]["id"],
+            first_node["session_token"],
+            oldest_terminal["id"],
+            "completed",
+            {"reply": "PONG"},
+            now=1.1,
+        )
+        newer_terminal = state.queue_task(first_node["node"]["id"], "PING", {})
+        state.poll_node(first_node["node"]["id"], first_node["session_token"], now=2.0)
+        state.submit_result(
+            first_node["node"]["id"],
+            first_node["session_token"],
+            newer_terminal["id"],
+            "completed",
+            {"reply": "PONG"},
+            now=2.1,
+        )
+
+        queued_ids = set()
+        for index, enrollment in enumerate(enrollments):
+            queue_count = (
+                MAX_QUEUED_TASKS_PER_NODE - 2
+                if index == 0
+                else MAX_QUEUED_TASKS_PER_NODE
+            )
+            for _ in range(queue_count):
+                task = state.queue_task(enrollment["node"]["id"], "PING", {})
+                queued_ids.add(task["id"])
+        self.assertEqual(len(state.tasks()), MAX_TASKS)
+
+        replacement = state.queue_task(first_node["node"]["id"], "PING", {})
+        retained_ids = {task["id"] for task in state.tasks()}
+        self.assertEqual(len(retained_ids), MAX_TASKS)
+        self.assertNotIn(oldest_terminal["id"], retained_ids)
+        self.assertIn(newer_terminal["id"], retained_ids)
+        self.assertIn(replacement["id"], retained_ids)
+        self.assertTrue(queued_ids.issubset(retained_ids))
+
+        prune_event = next(event for event in state.events() if event["kind"] == "task.pruned")
+        self.assertEqual(prune_event["task_id"], oldest_terminal["id"])
+        self.assertEqual(prune_event["data"]["status"], "completed")
+        self.assertEqual(prune_event["data"]["reason"], "terminal_task_retention_limit")
+        prune_audit = next(entry for entry in state.audit() if entry["action"] == "task.pruned")
+        self.assertEqual(prune_audit["task_id"], oldest_terminal["id"])
+        self.assertEqual(prune_audit["from_state"], "completed")
+        self.assertEqual(prune_audit["to_state"], "removed")
+        self.assertEqual(prune_audit["reason"], "terminal_task_retention_limit")
+
+
+if __name__ == "__main__":
+    unittest.main()
