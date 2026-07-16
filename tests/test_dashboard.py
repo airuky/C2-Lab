@@ -16,15 +16,25 @@ class IdCollector(HTMLParser):
         super().__init__()
         self.ids: list[str] = []
         self.assets: list[str] = []
+        self.label_depth = 0
+        self.buttons_inside_labels = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
+        if tag == "label":
+            self.label_depth += 1
+        elif tag == "button" and self.label_depth:
+            self.buttons_inside_labels += 1
         if attributes.get("id"):
             self.ids.append(attributes["id"] or "")
         if tag == "script" and attributes.get("src"):
             self.assets.append(attributes["src"] or "")
         if tag == "link" and attributes.get("href"):
             self.assets.append(attributes["href"] or "")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "label":
+            self.label_depth -= 1
 
 
 class DashboardTests(unittest.TestCase):
@@ -42,6 +52,12 @@ class DashboardTests(unittest.TestCase):
         for source in (self.html, self.javascript, self.styles):
             self.assertNotIn("https://", source)
             self.assertNotIn("http://", source)
+
+    def test_form_labels_do_not_nest_buttons(self) -> None:
+        parser = IdCollector()
+        parser.feed(self.html)
+        self.assertEqual(parser.label_depth, 0)
+        self.assertEqual(parser.buttons_inside_labels, 0)
 
     def test_user_data_is_rendered_without_html_sinks(self) -> None:
         for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function"):
@@ -118,6 +134,9 @@ class DashboardTests(unittest.TestCase):
         self.assertRegex(self.html, r'<details class="auth-card" id="tokenManagement" open>')
         self.assertRegex(self.html, r'<details class="panel startup-panel" id="startupPanel" open>')
         self.assertIn("NO SHELL · EPHEMERAL LAB FILES ONLY · NO REMOTE TRANSPORT", self.html)
+        self.assertIn('let openTaskDetailId = "";', self.javascript)
+        self.assertIn("refreshOpenTaskDetail(tasks, nodes);", self.javascript)
+        self.assertIn('if (task.status === "queued")', self.javascript)
 
     def test_task_retry_and_queue_controls_are_present(self) -> None:
         self.assertIn('headers["Idempotency-Key"]', self.javascript)
@@ -185,7 +204,14 @@ class DashboardTests(unittest.TestCase):
             "noteSubmitButton",
         ):
             self.assertIn(f'id="{element_id}"', self.html)
-        self.assertRegex(self.html, r'id="noteInput"[\s\S]+?maxlength="240"')
+        note_input = re.search(r'<textarea\s+[^>]*id="noteInput"[^>]*>', self.html)
+        self.assertIsNotNone(note_input)
+        self.assertNotIn("maxlength", note_input.group(0))
+        self.assertIn("function unicodeLength(value)", self.javascript)
+        self.assertIn("unicodeLength(noteMessage)", self.javascript)
+        self.assertIn("unicodeLength(message) > MAX_NOTE_LENGTH", self.javascript)
+        self.assertIn("unicodeLength(payload.text.trim())", self.javascript)
+        self.assertIn("unicodeLength(payload.message.trim())", self.javascript)
         self.assertIn('api("/lab/notes", {', self.javascript)
         self.assertIn('body: { message },', self.javascript)
         self.assertIn("pendingNoteSubmission", self.javascript)
@@ -201,6 +227,17 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("requestGeneration !== tokenGeneration", self.javascript)
         self.assertIn("elements.connectButton.disabled", self.javascript)
         self.assertIn("setTokenVisibility(false)", self.javascript)
+        for request in (
+            'await api(`/lab/tasks/${task.id}/cancel`, { method: "POST", body: {} });',
+            'const task = await api("/lab/tasks", {',
+            'await api("/lab/reset", { method: "POST", body: {} });',
+        ):
+            request_offset = self.javascript.index(request)
+            guard_offset = self.javascript.index(
+                "if (requestIsStale(requestGeneration, requestToken)) return;",
+                request_offset,
+            )
+            self.assertLess(guard_offset - request_offset, 500)
 
     def test_unchanged_task_rows_are_not_rebuilt_during_polling(self) -> None:
         self.assertIn('let renderedNodeKey = ""', self.javascript)
@@ -209,8 +246,18 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("if (renderKey === renderedTaskKey) return", self.javascript)
         self.assertIn('let renderedHistoryKey = ""', self.javascript)
         self.assertIn("if (historyKey === renderedHistoryKey) return", self.javascript)
-        self.assertIn("elements.taskDetailDialog.open ||", self.javascript)
-        self.assertIn('activeElement?.matches("input, select, textarea, summary")', self.javascript)
+        self.assertNotIn("const interacting = Boolean(", self.javascript)
+        self.assertNotIn('activeElement?.matches("input, select, textarea, summary")', self.javascript)
+        self.assertRegex(
+            self.javascript,
+            r'window\.setInterval\(\(\) => \{\s+if \(document\.visibilityState === "visible"\)',
+        )
+
+    def test_live_regions_and_narrow_layout_remain_usable(self) -> None:
+        self.assertIn("function setText(element, value)", self.javascript)
+        self.assertIn("setText(element, Number.isFinite(value)", self.javascript)
+        self.assertIn("setText(elements.noteCharacterCount", self.javascript)
+        self.assertNotIn("#resetButton {\n    display: none;", self.styles)
 
     def test_attack_exercise_ui_uses_fixed_catalog_and_rbac_actions(self) -> None:
         for element_id in (

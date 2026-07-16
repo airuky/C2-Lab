@@ -160,7 +160,7 @@ python3 -m c2lab teamserver [--port PORT]
 ### Node
 
 ```console
-python3 -m c2lab node --name NAME [--controller URL] [--profile PROFILE] [--poll-ms MS] [--enroll-token TOKEN]
+python3 -m c2lab node --name NAME [--controller URL] [--profile PROFILE] [--poll-ms MS] [--jitter PERCENT] [--enroll-token TOKEN]
 ```
 
 | オプション | 既定値 | 説明 |
@@ -169,6 +169,7 @@ python3 -m c2lab node --name NAME [--controller URL] [--profile PROFILE] [--poll
 | `--controller` | `http://127.0.0.1:8765` | loopback Teamserver URL |
 | `--profile` | `training` | `basic`、`training`、`purple_lab` |
 | `--poll-ms` | `1000` | poll 間隔。`250..3000` ミリ秒 |
+| `--jitter` | `0` | poll 間隔のランダム幅。`0..50` パーセント |
 | `--enroll-token` | prompt | 省略時は shell history に残らない非表示入力 |
 
 controller URL は `http` と `127.0.0.1` または `localhost` だけを許可します。`localhost` も内部では `127.0.0.1` へ正規化されます。認証情報、query、fragment、追加 path を含む URL と、loopback 以外の host は起動前に拒否されます。Node client は system proxy を無効化し、HTTP redirect を追跡しません。
@@ -281,7 +282,7 @@ Operator registers task
 
 Operatorのtask登録は任意の`Idempotency-Key`を受けます。8〜128文字の英数字と`-_.:`だけを許可し、retained memory state内で同じactor、Node、type、payload、queue TTLの再送を同じtaskへ収束させます。同じkeyを別actorまたは異なるrequestへ使うと`409 idempotency_conflict`です。UIは通信結果が不明な再試行で同じkeyを再利用し、正常受付または確定した4xx後に破棄します。key自体はtask、event、audit、reportへ公開しません。
 
-Node は実行済み result を acknowledgement が返るまで memory 内の pending-result outbox に保持し、新しい task を poll する前に同じ result を再送します。Teamserver に届く前に request が失われた場合は再送で登録され、登録後の HTTP response だけが失われた場合も、同じ status と result の再送は冪等な成功になります。異なる内容の再送は `409 result_conflict` です。Node process を終了すると outbox も失われるため、永続配送を保証する仕組みではありません。
+Node は実行済み result を acknowledgement が返るまで memory 内の pending-result outbox に保持し、新しい task を poll する前に同じ result を再送します。Teamserver に届く前に request が失われた場合は再送で登録され、登録後の HTTP response だけが失われた場合も、同じ status と result の再送は冪等な成功になります。確定taskが通常一覧からretention整理された後も、最大500件のbounded ACK tombstoneが同一結果の再送へ同じresponseを返し、counterやeventを重複させません。異なる内容の再送は `409 result_conflict` です。Node process を終了すると outbox も失われ、tombstoneも永続化されないため、永続配送を保証する仕組みではありません。
 
 `SLEEP`のpoll設定とNode側`tasks_completed`は、resultのacknowledgement後にだけcommitします。task timeout後などの確定4xxでresultが拒否された場合は、Nodeだけが設定を先行変更せず、Teamserverと同じ旧poll状態を維持します。
 
@@ -368,7 +369,8 @@ Node session 要求は `Authorization: Node <session-token>` と `X-C2Lab-Node: 
 | access log queue | 256。満杯時はrequestをblockせずdrop countを加算 |
 | Operator session | 起動時3件、TTL 8時間、memory-only digest。registry上限64で、満杯時は最古のexpired / revokedだけを整理し、全件activeなら`429 session_limit` |
 | Node record | 20。stale offline後60秒でsession失効。上限時は最古の`session_active: false` recordだけを自動整理 |
-| 全 task | 500。到達時は最古のterminal taskだけを整理。全件non-terminalなら`429 task_limit` |
+| 全 task | 500。到達時はrunning exerciseの参照taskを保護し、最古の整理可能なterminal taskだけを整理。対象不足なら`429 task_limit` |
+| result ACK tombstone | 500。受付済みresultのretention整理後の同一再送だけに使用 |
 | 1 Node の queued task | 50 |
 | 1 Node の queued `RUN_PLAYBOOK` | 3 |
 | 保持 exercise | 50。timelineは各16件、scenarioあたりtaskは2件 |

@@ -126,6 +126,41 @@ class LabServerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_server(LabState(), OPERATOR_TOKEN, OPERATOR_TOKEN, 0)
 
+    def test_server_rejects_inactive_operator_secret_as_enrollment_secret(self) -> None:
+        registry = OperatorSessionRegistry()
+        now = time.monotonic()
+        registry.register("active-admin", "admin", ADMIN_TOKEN, now=now)
+        expired = "generated-expired-enrollment-candidate-" + "x" * 32
+        revoked = "generated-revoked-enrollment-candidate-" + "r" * 32
+        registry.register(
+            "expired-candidate",
+            "viewer",
+            expired,
+            ttl_seconds=1,
+            now=now - 10,
+        )
+        revoked_session = registry.register(
+            "revoked-candidate",
+            "viewer",
+            revoked,
+            now=now,
+        )
+        registry.revoke(
+            revoked_session["id"],
+            actor_session_id=registry.authenticate(ADMIN_TOKEN)["id"],
+            now=now,
+        )
+
+        for enrollment_secret in (expired, revoked):
+            with self.subTest(enrollment_secret=enrollment_secret), self.assertRaises(ValueError):
+                create_server(
+                    LabState(),
+                    ADMIN_TOKEN,
+                    enrollment_secret,
+                    0,
+                    operator_registry=registry,
+                )
+
     def test_blocked_access_log_sink_cannot_block_requests_or_shutdown_indefinitely(self) -> None:
         sink = BlockingAccessLogStream()
         server = create_server(
@@ -764,6 +799,62 @@ class OperatorRBACServerTests(unittest.TestCase):
         )
         self.assertEqual(self_revoke_status, 409)
         self.assertEqual(self_revoke["error"]["code"], "last_admin_session")
+
+    def test_revocation_while_request_body_is_pending_prevents_mutation(self) -> None:
+        slow_token = "generated-slow-operator-token-" + "s" * 32
+        slow_session = self.registry.register(
+            "slow-operator",
+            "operator",
+            slow_token,
+            ttl_seconds=600,
+        )
+        first_authorization = threading.Event()
+        original_authenticate = self.registry.authenticate
+
+        def tracked_authenticate(secret: Any, **kwargs: Any) -> dict[str, Any] | None:
+            result = original_authenticate(secret, **kwargs)
+            if secret == slow_token and result is not None:
+                first_authorization.set()
+            return result
+
+        body = json.dumps({"message": "must not be recorded"}).encode("utf-8")
+        connection = socket.create_connection((LOOPBACK_HOST, self.port), timeout=2)
+        try:
+            request_headers = (
+                "POST /lab/notes HTTP/1.1\r\n"
+                f"Host: {LOOPBACK_HOST}:{self.port}\r\n"
+                f"Authorization: Bearer {slow_token}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            with mock.patch.object(
+                self.registry,
+                "authenticate",
+                side_effect=tracked_authenticate,
+            ):
+                connection.sendall(request_headers)
+                self.assertTrue(first_authorization.wait(timeout=1))
+                self.registry.revoke(
+                    slow_session["id"],
+                    actor_session_id=self.sessions["admin"]["id"],
+                )
+                connection.sendall(body)
+                response = http.client.HTTPResponse(connection)
+                response.begin()
+                payload = json.loads(response.read())
+
+            self.assertEqual(response.status, 401)
+            self.assertEqual(payload["error"]["code"], "unauthorized")
+            self.assertFalse(
+                any(
+                    event["kind"] == "operator.note"
+                    and event["data"]["message"] == "must not be recorded"
+                    for event in self.state.events()
+                )
+            )
+        finally:
+            connection.close()
 
     def test_role_permissions_enforce_read_task_write_and_reset(self) -> None:
         for secret in (VIEWER_TOKEN, TASK_OPERATOR_TOKEN, ADMIN_TOKEN):

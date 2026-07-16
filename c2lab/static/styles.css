@@ -1942,8 +1942,21 @@ textarea[aria-invalid="true"] {
     width: min(100% - 24px, 1420px);
   }
 
-  #resetButton {
+  .app-header__inner {
+    gap: 8px;
+  }
+
+  .brand__copy {
     display: none;
+  }
+
+  .header-actions {
+    gap: 4px;
+  }
+
+  #resetButton {
+    padding-inline: 7px;
+    font-size: 9px;
   }
 
   .metric-grid {

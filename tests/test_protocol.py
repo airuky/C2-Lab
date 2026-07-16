@@ -82,7 +82,13 @@ class TaskResultContractTests(unittest.TestCase):
         payload = {"interval_ms": 2000, "jitter_percent": 20}
         valid = {"previous_interval_ms": 1000, "new_interval_ms": 2000, "jitter_percent": 20}
         self.assertEqual(
-            validate_task_result("SLEEP", payload, "completed", valid),
+            validate_task_result(
+                "SLEEP",
+                payload,
+                "completed",
+                valid,
+                expected_runtime={"poll_interval_ms": 1000},
+            ),
             ("completed", valid),
         )
         with self.assertRaises(ProtocolError):
@@ -95,6 +101,37 @@ class TaskResultContractTests(unittest.TestCase):
                 "SLEEP", payload, "completed",
                 {"previous_interval_ms": 1000, "new_interval_ms": 2000, "jitter_percent": 10},
             )
+        with self.assertRaises(ProtocolError):
+            validate_task_result(
+                "SLEEP",
+                payload,
+                "completed",
+                valid,
+                expected_runtime={"poll_interval_ms": 1500},
+            )
+
+    def test_fixed_results_do_not_coerce_json_scalar_types(self) -> None:
+        event_payload = {"category": "training", "severity": "info", "message": "event"}
+        invalid_results = (
+            ("WAIT", {"milliseconds": 0}, {"waited_ms": False}),
+            ("WAIT", {"milliseconds": 1}, {"waited_ms": True}),
+            ("WAIT", {"milliseconds": 25}, {"waited_ms": 25.0}),
+            ("EXIT", {}, {"acknowledged": 1}),
+            ("EXIT", {}, {"acknowledged": 1.0}),
+            (
+                "GENERATE_EVENT",
+                event_payload,
+                {
+                    "recorded": 1,
+                    "category": "training",
+                    "severity": "info",
+                    "message": "event",
+                },
+            ),
+        )
+        for task_type, payload, result in invalid_results:
+            with self.subTest(task_type=task_type, result=result), self.assertRaises(ProtocolError):
+                validate_task_result(task_type, payload, "completed", result)
 
     def test_exit_result_must_be_acknowledged(self) -> None:
         self.assertEqual(

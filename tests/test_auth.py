@@ -102,6 +102,32 @@ class OperatorSessionRegistryTests(unittest.TestCase):
         self.assertIsNone(self.registry.authenticate(token("revoked"), now=21.0))
         self.assertEqual(expired["principal_id"], "expiry-viewer")
 
+    def test_registered_token_check_includes_expired_and_revoked_sessions(self) -> None:
+        expired_secret = token("registered-expired")
+        revoked_secret = token("registered-revoked")
+        self.registry.register(
+            "expired-session",
+            "viewer",
+            expired_secret,
+            ttl_seconds=1,
+            now=10.0,
+        )
+        revoked = self.registry.register(
+            "revoked-session",
+            "viewer",
+            revoked_secret,
+            ttl_seconds=100,
+            now=10.0,
+        )
+        self.registry.revoke(revoked["id"], now=11.0)
+
+        self.assertIsNone(self.registry.authenticate(expired_secret, now=11.0))
+        self.assertIsNone(self.registry.authenticate(revoked_secret, now=11.0))
+        self.assertTrue(self.registry.has_registered_token(expired_secret))
+        self.assertTrue(self.registry.has_registered_token(revoked_secret))
+        self.assertFalse(self.registry.has_registered_token(token("unknown")))
+        self.assertFalse(self.registry.has_registered_token(None))
+
     def test_list_and_returned_sessions_never_expose_token_material(self) -> None:
         secret = token("redaction")
         registered = self.registry.register("audit-viewer", "viewer", secret, now=10.0)

@@ -44,6 +44,23 @@ def is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _same_json_value(actual: Any, expected: Any) -> bool:
+    """Compare JSON-shaped values without Python's bool/number coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return set(actual) == set(expected) and all(
+            _same_json_value(actual[key], expected[key]) for key in expected
+        )
+    if type(expected) is list:
+        return len(actual) == len(expected) and all(
+            _same_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
 def clean_text(value: Any, field: str, *, minimum: int = 1, maximum: int = 120) -> str:
     if not isinstance(value, str):
         raise ProtocolError(f"{field} must be a string")
@@ -198,9 +215,10 @@ def validate_task_result(
         return clean_status, {"error_code": clean_result["error_code"]}
 
     if task_type == "PING":
-        if clean_result != {"reply": "PONG"}:
+        expected = {"reply": "PONG"}
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("PING result must be the fixed PONG response")
-        return clean_status, {"reply": "PONG"}
+        return clean_status, expected
 
     if task_type == "RUNTIME_STATUS":
         exact_keys(
@@ -218,10 +236,16 @@ def validate_task_result(
         if not is_int(tasks_completed) or not 0 <= tasks_completed <= 1_000_000:
             raise ProtocolError("tasks_completed must be an integer from 0 to 1000000")
         if expected_runtime is not None and (
-            version != expected_runtime.get("version")
-            or profile != expected_runtime.get("profile")
-            or poll_interval_ms != expected_runtime.get("poll_interval_ms")
-            or jitter_percent != expected_runtime.get("jitter_percent", 0)
+            not _same_json_value(version, expected_runtime.get("version"))
+            or not _same_json_value(profile, expected_runtime.get("profile"))
+            or not _same_json_value(
+                poll_interval_ms,
+                expected_runtime.get("poll_interval_ms"),
+            )
+            or not _same_json_value(
+                jitter_percent,
+                expected_runtime.get("jitter_percent", 0),
+            )
         ):
             raise ProtocolError("runtime identity fields do not match the enrolled node")
         return clean_status, {
@@ -235,7 +259,7 @@ def validate_task_result(
 
     if task_type == "ECHO_TEXT":
         expected = {"echo": task_payload["text"]}
-        if clean_result != expected:
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("ECHO_TEXT result must match the queued text")
         return clean_status, expected
 
@@ -244,13 +268,13 @@ def validate_task_result(
             "algorithm": "sha256",
             "digest": hashlib.sha256(task_payload["text"].encode("utf-8")).hexdigest(),
         }
-        if clean_result != expected:
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("HASH_TEXT result must match the queued text digest")
         return clean_status, expected
 
     if task_type == "WAIT":
         expected = {"waited_ms": task_payload["milliseconds"]}
-        if clean_result != expected:
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("WAIT result must match the bounded wait request")
         return clean_status, expected
 
@@ -264,13 +288,18 @@ def validate_task_result(
         jitter = clean_result["jitter_percent"]
         if not is_int(prev) or not MIN_POLL_INTERVAL_MS <= prev <= MAX_POLL_INTERVAL_MS:
             raise ProtocolError("previous_interval_ms is outside the supported range")
+        if expected_runtime is not None and not _same_json_value(
+            prev,
+            expected_runtime.get("poll_interval_ms"),
+        ):
+            raise ProtocolError("previous_interval_ms does not match the enrolled node")
         if not is_int(new) or not MIN_POLL_INTERVAL_MS <= new <= MAX_POLL_INTERVAL_MS:
             raise ProtocolError("new_interval_ms is outside the supported range")
-        if new != task_payload["interval_ms"]:
+        if not _same_json_value(new, task_payload["interval_ms"]):
             raise ProtocolError("new_interval_ms must match the requested interval")
         if not is_int(jitter) or not 0 <= jitter <= MAX_JITTER_PERCENT:
             raise ProtocolError("jitter_percent is outside the supported range")
-        if jitter != task_payload["jitter_percent"]:
+        if not _same_json_value(jitter, task_payload["jitter_percent"]):
             raise ProtocolError("jitter_percent must match the requested jitter")
         return clean_status, {
             "previous_interval_ms": prev,
@@ -279,9 +308,10 @@ def validate_task_result(
         }
 
     if task_type == "EXIT":
-        if clean_result != {"acknowledged": True}:
+        expected = {"acknowledged": True}
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("EXIT result must be the fixed acknowledgement")
-        return clean_status, {"acknowledged": True}
+        return clean_status, expected
 
     if task_type == "GENERATE_EVENT":
         expected = {
@@ -290,7 +320,7 @@ def validate_task_result(
             "severity": task_payload["severity"],
             "message": task_payload["message"],
         }
-        if clean_result != expected:
+        if not _same_json_value(clean_result, expected):
             raise ProtocolError("GENERATE_EVENT result must match the queued event")
         return clean_status, expected
 

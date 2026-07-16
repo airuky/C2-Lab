@@ -57,6 +57,7 @@ MIN_IDEMPOTENCY_KEY_LENGTH = 8
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
 DEFAULT_OPERATOR_ACTOR = "operator"
 MAX_OPERATOR_ACTOR_LENGTH = 48
+MAX_TASK_RESULT_TOMBSTONES = MAX_TASKS
 TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "timeout", "cancelled", "expired"}
 )
@@ -144,6 +145,23 @@ def _validate_sync_limit(value: Any) -> int:
     return value
 
 
+def _type_strict_equal(left: Any, right: Any) -> bool:
+    """Compare validated JSON values without Python's bool/int coercion."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        if len(left) != len(right) or any(key not in right for key in left):
+            return False
+        return all(_type_strict_equal(value, right[key]) for key, value in left.items())
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _type_strict_equal(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        )
+    return left == right
+
+
 class LabState:
     """Thread-safe Teamserver state shared by operator and node API handlers."""
 
@@ -151,6 +169,7 @@ class LabState:
         self._lock = threading.RLock()
         self._nodes: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._task_result_tombstones: dict[str, dict[str, Any]] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS)
         self._audit_entries: deque[dict[str, Any]] = deque(maxlen=MAX_AUDIT_ENTRIES)
         self._note_idempotency: dict[str, tuple[str, str, str]] = {}
@@ -158,7 +177,12 @@ class LabState:
         self._exercise_idempotency: dict[str, tuple[str, str, str, str]] = {}
         self._event_sequence = 0
         self._audit_sequence = 0
+        self._task_sequence = 0
         self._stream_id = f"stream-{secrets.token_hex(12)}"
+
+    def _next_task_sequence_locked(self) -> int:
+        self._task_sequence += 1
+        return self._task_sequence
 
     def _record_locked(
         self,
@@ -425,7 +449,7 @@ class LabState:
                 for task in self._tasks.values()
                 if task["node_id"] == node_id and task["status"] == "queued"
             ]
-            task = min(candidates, key=lambda item: item["created_at"]) if candidates else None
+            task = min(candidates, key=lambda item: item["_sequence"]) if candidates else None
             if task is not None:
                 task["status"] = "dispatched"
                 task["dispatched_at"] = utc_now()
@@ -471,15 +495,33 @@ class LabState:
             self._expire_locked(instant)
             node = self._require_node_session_locked(node_id, session_token)
             task = self._tasks.get(task_id) if isinstance(task_id, str) else None
-            if task is None or task["node_id"] != node_id:
+            tombstone = (
+                self._task_result_tombstones.get(task_id)
+                if task is None and isinstance(task_id, str)
+                else None
+            )
+            result_record = task if task is not None else tombstone
+            if result_record is None or result_record["node_id"] != node_id:
                 raise LabError("task not found for node", code="not_found", status=404)
             try:
                 clean_status, clean_result = validate_result(status, result)
             except ProtocolError as error:
-                self._reject_result_locked(task, reason="invalid_result_envelope")
+                self._reject_result_locked(result_record, reason="invalid_result_envelope")
                 raise LabError(str(error), code="invalid_result") from error
+            if task is None:
+                if result_record["status"] == clean_status and _type_strict_equal(
+                    result_record["result"], clean_result
+                ):
+                    return self._node_task(result_record)
+                raise LabError(
+                    "task already has a different result",
+                    code="result_conflict",
+                    status=409,
+                )
             if task["status"] in {"completed", "failed"}:
-                if task["status"] == clean_status and task["result"] == clean_result:
+                if task["status"] == clean_status and _type_strict_equal(
+                    task["result"], clean_result
+                ):
                     return self._node_task(task)
                 raise LabError(
                     "task already has a different result",
@@ -508,6 +550,7 @@ class LabState:
 
             task["status"] = clean_status
             task["result"] = copy.deepcopy(clean_result)
+            task["_result_accepted"] = True
             task["completed_at"] = utc_now()
             node["last_seen"] = utc_now()
             node["_last_seen_monotonic"] = instant
@@ -629,46 +672,72 @@ class LabState:
             )
             return self._public_node(node)
 
-    def _prune_oldest_terminal_task_locked(self) -> None:
-        """Make one task slot without ever removing queued or dispatched work."""
+    def _task_is_required_by_running_exercise_locked(self, task: dict[str, Any]) -> bool:
+        exercise_id = task.get("_exercise_id")
+        if not isinstance(exercise_id, str):
+            return False
+        exercise = self._exercises.get(exercise_id)
+        return exercise is not None and exercise["status"] == "running"
 
-        # ISO timestamps are sortable; dictionary insertion order is the stable
-        # tie-breaker when multiple tasks share the same millisecond.
-        oldest = min(
-            (task for task in self._tasks.values() if task["status"] in TERMINAL_TASK_STATUSES),
-            key=lambda task: task["created_at"],
-            default=None,
-        )
-        if oldest is None:
-            raise LabError("task limit reached; reset the lab", code="task_limit", status=429)
+    def _remember_task_result_tombstone_locked(self, task: dict[str, Any]) -> None:
+        """Retain a bounded ACK record so a Node can safely retry after pruning."""
 
-        del self._tasks[oldest["id"]]
+        if not task.get("_result_accepted"):
+            return
+        while len(self._task_result_tombstones) >= MAX_TASK_RESULT_TOMBSTONES:
+            oldest_task_id = next(iter(self._task_result_tombstones))
+            del self._task_result_tombstones[oldest_task_id]
+        self._task_result_tombstones[task["id"]] = self._node_task(task)
+
+    def _prune_terminal_task_locked(self, task: dict[str, Any]) -> None:
+        self._remember_task_result_tombstone_locked(task)
+        del self._tasks[task["id"]]
         reason = "terminal_task_retention_limit"
         self._record_locked(
             "task.pruned",
             level="warning",
-            node_id=oldest["node_id"],
-            task_id=oldest["id"],
-            correlation_id=oldest["correlation_id"],
+            node_id=task["node_id"],
+            task_id=task["id"],
+            correlation_id=task["correlation_id"],
             data={
-                "type": oldest["type"],
-                "status": oldest["status"],
-                "correlation_id": oldest["correlation_id"],
+                "type": task["type"],
+                "status": task["status"],
+                "correlation_id": task["correlation_id"],
                 "reason": reason,
             },
         )
         self._audit_locked(
             "task.pruned",
             actor="teamserver",
-            node_id=oldest["node_id"],
-            task_id=oldest["id"],
-            correlation_id=oldest["correlation_id"],
-            task_type=oldest["type"],
-            from_state=oldest["status"],
+            node_id=task["node_id"],
+            task_id=task["id"],
+            correlation_id=task["correlation_id"],
+            task_type=task["type"],
+            from_state=task["status"],
             to_state="removed",
             outcome="success",
             reason=reason,
         )
+
+    def _make_task_slots_locked(self, required_slots: int) -> None:
+        """Atomically free task slots without dropping live scenario evidence."""
+
+        slots_to_free = len(self._tasks) + required_slots - MAX_TASKS
+        if slots_to_free <= 0:
+            return
+        candidates = sorted(
+            (
+                task
+                for task in self._tasks.values()
+                if task["status"] in TERMINAL_TASK_STATUSES
+                and not self._task_is_required_by_running_exercise_locked(task)
+            ),
+            key=lambda task: task["_sequence"],
+        )
+        if len(candidates) < slots_to_free:
+            raise LabError("task limit reached; reset the lab", code="task_limit", status=429)
+        for task in candidates[:slots_to_free]:
+            self._prune_terminal_task_locked(task)
 
     def queue_task(
         self,
@@ -759,8 +828,7 @@ class LabState:
                         code="playbook_queue_limit",
                         status=429,
                     )
-            if len(self._tasks) >= MAX_TASKS:
-                self._prune_oldest_terminal_task_locked()
+            self._make_task_slots_locked(1)
 
             task_id = f"task-{uuid.uuid4().hex[:12]}"
             task = {
@@ -777,9 +845,11 @@ class LabState:
                 "dispatched_at": None,
                 "completed_at": None,
                 "delivery_attempts": 0,
+                "_sequence": self._next_task_sequence_locked(),
                 "_deadline": None,
                 "_queue_deadline": instant + clean_ttl,
                 "_idempotency_key": clean_idempotency_key,
+                "_result_accepted": False,
             }
             self._tasks[task_id] = task
             self._record_locked(
@@ -1217,12 +1287,7 @@ class LabState:
                     code="playbook_queue_limit",
                     status=429,
                 )
-            if len(self._tasks) + len(playbooks) > MAX_TASKS:
-                raise LabError(
-                    "task limit reached; reset the lab",
-                    code="task_limit",
-                    status=429,
-                )
+            self._make_task_slots_locked(len(playbooks))
 
             exercise_id = f"exercise-{uuid.uuid4().hex[:12]}"
             timestamp = utc_now()
@@ -1280,10 +1345,12 @@ class LabState:
                     "dispatched_at": None,
                     "completed_at": None,
                     "delivery_attempts": 0,
+                    "_sequence": self._next_task_sequence_locked(),
                     "_deadline": None,
                     "_queue_deadline": instant + DEFAULT_QUEUE_TTL_SECONDS,
                     "_idempotency_key": None,
                     "_exercise_id": exercise_id,
+                    "_result_accepted": False,
                 }
                 self._tasks[task_id] = task
                 exercise["task_ids"].append(task_id)
@@ -1496,6 +1563,7 @@ class LabState:
         with self._lock:
             self._nodes.clear()
             self._tasks.clear()
+            self._task_result_tombstones.clear()
             self._exercises.clear()
             self._events.clear()
             self._note_idempotency.clear()
@@ -1521,11 +1589,14 @@ class LabState:
 
     def tasks(self) -> list[dict[str, Any]]:
         with self._lock:
-            return sorted(
-                (self._public_task(task) for task in self._tasks.values()),
-                key=lambda task: task["created_at"],
-                reverse=True,
-            )
+            return [
+                self._public_task(task)
+                for task in sorted(
+                    self._tasks.values(),
+                    key=lambda task: task["_sequence"],
+                    reverse=True,
+                )
+            ]
 
     def events(self) -> list[dict[str, Any]]:
         with self._lock:

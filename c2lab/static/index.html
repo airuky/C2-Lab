@@ -92,8 +92,8 @@
             </div>
           </summary>
           <form class="auth-card__form" id="tokenForm">
-            <label class="field" for="tokenInput">
-              <span class="field__label">Bearer token</span>
+            <div class="field">
+              <label class="field__label" for="tokenInput">Bearer token</label>
               <span class="token-field">
                 <input
                   id="tokenInput"
@@ -113,7 +113,7 @@
                   表示
                 </button>
               </span>
-            </label>
+            </div>
             <div class="auth-card__actions">
               <button class="button button--primary" id="connectButton" type="submit">接続する</button>
               <button class="button button--quiet" id="clearTokenButton" type="button">消去</button>
@@ -273,9 +273,9 @@
                 <option value="CLEANUP">CLEANUP</option>
               </select>
             </label>
-            <label class="field" id="taskPayloadField" for="taskPayloadInput">
+            <div class="field" id="taskPayloadField">
               <span class="field__label field__label--split">
-                <span>Payload (JSON)</span>
+                <label for="taskPayloadInput">Payload (JSON)</label>
                 <button class="text-button" id="restoreTemplateButton" type="button">テンプレートに戻す</button>
               </span>
               <textarea
@@ -286,7 +286,7 @@
                 spellcheck="false"
                 aria-describedby="payloadHint payloadError"
               >{}</textarea>
-            </label>
+            </div>
             <div class="payload-meta">
               <p id="payloadHint">Node との疎通を確認します。payload は空オブジェクトです。</p>
               <p class="field-error" id="payloadError" role="alert"></p>
@@ -463,7 +463,6 @@
               id="noteInput"
               name="message"
               rows="3"
-              maxlength="240"
               required
               disabled
               autocomplete="off"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from c2lab.core import LabError, LabState
 from c2lab.exercises import MAX_EXERCISE_TIMELINE
@@ -135,6 +136,54 @@ class AttackExerciseTests(unittest.TestCase):
         self.assertEqual(len(exercise["alerts"]), 1)
         self.assertEqual(exercise["alerts"][0]["source_id"], "DET0140")
         self.assertEqual(exercise["alerts"][0]["technique_id"], "T1070.004")
+
+    def test_running_exercise_tasks_are_not_pruned_before_completion(self) -> None:
+        with patch("c2lab.core.MAX_TASKS", 3):
+            exercise = self.state.start_exercise(self.node_id, "DISCOVERY_COLLECTION")
+            with EphemeralLabWorkspace() as workspace:
+                first = self.complete_next(workspace)
+                filler = self.state.queue_task(self.node_id, "PING", {})
+                with self.assertRaises(LabError) as context:
+                    self.state.queue_task(self.node_id, "PING", {})
+                self.assertEqual(context.exception.code, "task_limit")
+                self.assertIn(first["id"], {task["id"] for task in self.state.tasks()})
+                self.assertEqual(self.state.exercises()[0]["status"], "running")
+
+                self.complete_next(workspace)
+
+            self.assertEqual(self.state.exercises()[0]["status"], "completed")
+            replacement = self.state.queue_task(self.node_id, "PING", {})
+            retained_ids = {task["id"] for task in self.state.tasks()}
+            self.assertNotIn(first["id"], retained_ids)
+            self.assertIn(filler["id"], retained_ids)
+            self.assertIn(replacement["id"], retained_ids)
+            self.assertEqual(self.state.exercises()[0]["id"], exercise["id"])
+            self.assertEqual(self.state.exercises()[0]["status"], "completed")
+
+    def test_start_exercise_prunes_enough_eligible_terminal_tasks_atomically(self) -> None:
+        with patch("c2lab.core.MAX_TASKS", 2):
+            old_task_ids = set()
+            for offset in range(2):
+                task = self.state.queue_task(self.node_id, "PING", {})
+                old_task_ids.add(task["id"])
+                self.state.poll_node(self.node_id, self.session_token, now=10.0 + offset)
+                self.state.submit_result(
+                    self.node_id,
+                    self.session_token,
+                    task["id"],
+                    "completed",
+                    {"reply": "PONG"},
+                    now=10.1 + offset,
+                )
+
+            exercise = self.state.start_exercise(self.node_id, "DISCOVERY_COLLECTION")
+            retained_ids = {task["id"] for task in self.state.tasks()}
+            self.assertEqual(retained_ids, set(exercise["task_ids"]))
+            self.assertTrue(old_task_ids.isdisjoint(retained_ids))
+            self.assertEqual(
+                len([event for event in self.state.events() if event["kind"] == "task.pruned"]),
+                2,
+            )
 
     def test_start_validation_idempotency_and_reset_are_non_leaking(self) -> None:
         first = self.state.start_exercise(

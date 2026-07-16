@@ -166,6 +166,23 @@ def _require_exact_keys(value: Any, expected: set[str]) -> dict[str, Any]:
     return value
 
 
+def _same_json_value(actual: Any, expected: Any) -> bool:
+    """Compare JSON-shaped values without Python's bool/number coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return set(actual) == set(expected) and all(
+            _same_json_value(actual[key], expected[key]) for key in expected
+        )
+    if type(expected) is list:
+        return len(actual) == len(expected) and all(
+            _same_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
 def validate_playbook_result(playbook: Any, result: Any) -> dict[str, Any]:
     """Validate and copy a type-specific, path-free playbook result."""
 
@@ -177,11 +194,11 @@ def validate_playbook_result(playbook: Any, result: Any) -> dict[str, Any]:
     )
     if clean["playbook"] != playbook:
         raise LabRuntimeError("invalid playbook result schema", code="result_schema")
-    if clean["scope"] != _SCOPE:
+    if not _same_json_value(clean["scope"], _SCOPE):
         raise LabRuntimeError("invalid playbook result schema", code="result_schema")
-    if clean["attack_techniques"] != _TECHNIQUES[playbook]:
+    if not _same_json_value(clean["attack_techniques"], _TECHNIQUES[playbook]):
         raise LabRuntimeError("invalid playbook result schema", code="result_schema")
-    if clean["steps"] != _STEPS[playbook]:
+    if not _same_json_value(clean["steps"], _STEPS[playbook]):
         raise LabRuntimeError("invalid playbook result schema", code="result_schema")
     if type(clean["evidence"]) is not list:
         raise LabRuntimeError("invalid playbook result schema", code="result_schema")
@@ -194,11 +211,12 @@ def validate_playbook_result(playbook: Any, result: Any) -> dict[str, Any]:
         for item, definition in zip(evidence, FIXTURE_DEFINITIONS, strict=True):
             artifact = definition[0]
             entry = _require_exact_keys(item, {"artifact", "observation", "bytes"})
-            if (
-                entry["artifact"] != artifact
-                or entry["observation"] != "fixture-enumerated"
-                or entry["bytes"] != len(definition[3])
-            ):
+            expected_entry = {
+                "artifact": artifact,
+                "observation": "fixture-enumerated",
+                "bytes": len(definition[3]),
+            }
+            if not _same_json_value(entry, expected_entry):
                 raise LabRuntimeError("invalid playbook result schema", code="result_schema")
     elif playbook == "COLLECT_AND_STAGE":
         if len(evidence) != len(fixture_names) + 1:
@@ -209,22 +227,23 @@ def validate_playbook_result(playbook: Any, result: Any) -> dict[str, Any]:
                 item,
                 {"artifact", "observation", "bytes", "sha256"},
             )
-            if (
-                entry["artifact"] != artifact
-                or entry["observation"] != "content-hashed"
-                or entry["bytes"] != len(definition[3])
-                or entry["sha256"] != hashlib.sha256(definition[3]).hexdigest()
-            ):
+            expected_entry = {
+                "artifact": artifact,
+                "observation": "content-hashed",
+                "bytes": len(definition[3]),
+                "sha256": hashlib.sha256(definition[3]).hexdigest(),
+            }
+            if not _same_json_value(entry, expected_entry):
                 raise LabRuntimeError("invalid playbook result schema", code="result_schema")
         manifest = _require_exact_keys(
             evidence[-1],
             {"artifact", "observation", "entries"},
         )
-        if manifest != {
+        if not _same_json_value(manifest, {
             "artifact": MANIFEST_ARTIFACT,
             "observation": "manifest-written",
             "entries": len(fixture_names),
-        }:
+        }):
             raise LabRuntimeError("invalid playbook result schema", code="result_schema")
     elif playbook == "CREATE_CANARY":
         if len(evidence) != 1:
@@ -233,7 +252,7 @@ def validate_playbook_result(playbook: Any, result: Any) -> dict[str, Any]:
         if (
             marker["artifact"] != CANARY_ARTIFACT
             or marker["observation"] not in {"canary-created", "canary-already-present"}
-            or marker["bytes"] != len(_CANARY_BYTES)
+            or not _same_json_value(marker["bytes"], len(_CANARY_BYTES))
         ):
             raise LabRuntimeError("invalid playbook result schema", code="result_schema")
     else:

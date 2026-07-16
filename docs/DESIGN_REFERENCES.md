@@ -117,7 +117,8 @@ queue TTL、queued taskの取消、task登録のidempotency key、terminal-only 
 - cancelは`queued`だけを`cancelled`にし、同じ取消の再送を冪等にする
 - 任意`Idempotency-Key`は同じactor、Node、type、payload、queue TTLの再送だけを同じretained taskへ収束させ、Nodeには公開しない
 - stale offlineは60秒間回復可能とし、期限後はsessionと未処理taskを閉じる
-- 500件到達時は最古のterminal taskだけを整理し、`queued` / `dispatched`を削除しない
+- 500件到達時はrunning exerciseが参照するtaskを保護しつつ、内部作成sequence上で最古のterminal taskだけを整理し、`queued` / `dispatched`を削除しない
+- 受付済みresultは最大500件のbounded ACK tombstoneへ残し、task整理後にresponseだけを失ったNodeの同一再送を重複副作用なしで受理する
 
 ### 7. Local control-plane hardening
 

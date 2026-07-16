@@ -461,6 +461,12 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "route not found")
                 return
             body = self._read_json_object()
+            # A request body can arrive long after its headers. Re-check the
+            # session immediately before dispatch so a revocation or expiry
+            # during that interval takes effect before any state mutation.
+            session = self._authorize_operator(permission)
+            if session is None:
+                return
             if path == "/lab/tasks":
                 self._require_body_keys(
                     body,
@@ -822,7 +828,7 @@ def create_server(
         raise ValueError("operator_registry must be an OperatorSessionRegistry")
     elif operator_registry.authenticate(operator_token) is None:
         raise ValueError("operator token must identify an active registered session")
-    if operator_registry.authenticate(enrollment_token) is not None:
+    if operator_registry.has_registered_token(enrollment_token):
         raise ValueError("operator and enrollment tokens must be different")
     if runtime is not None and not callable(getattr(runtime, "health", None)):
         raise ValueError("runtime must provide health()")

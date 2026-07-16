@@ -102,6 +102,24 @@ class EphemeralLabWorkspaceTests(unittest.TestCase):
         with self.assertRaises(LabRuntimeError):
             validate_playbook_result("COLLECT_AND_STAGE", result)
 
+    def test_result_validator_does_not_coerce_json_scalar_types(self) -> None:
+        for replacement in (0, 0.0):
+            result = self.runtime.execute("DISCOVERY_FIXTURES")
+            result["scope"]["host_access"] = replacement
+            with self.subTest(field="host_access", replacement=replacement):
+                with self.assertRaises(LabRuntimeError):
+                    validate_playbook_result("DISCOVERY_FIXTURES", result)
+
+        result = self.runtime.execute("DISCOVERY_FIXTURES")
+        result["evidence"][0]["bytes"] = float(result["evidence"][0]["bytes"])
+        with self.assertRaises(LabRuntimeError):
+            validate_playbook_result("DISCOVERY_FIXTURES", result)
+
+        result = self.runtime.execute("COLLECT_AND_STAGE")
+        result["evidence"][-1]["entries"] = float(result["evidence"][-1]["entries"])
+        with self.assertRaises(LabRuntimeError):
+            validate_playbook_result("COLLECT_AND_STAGE", result)
+
     def test_context_and_close_remove_the_temporary_workspace(self) -> None:
         runtime = EphemeralLabWorkspace()
         root = runtime._root

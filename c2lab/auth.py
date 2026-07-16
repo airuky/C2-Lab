@@ -235,6 +235,24 @@ class OperatorSessionRegistry:
                 return None
             return self._public_locked(matched, instant)
 
+    def has_registered_token(self, token: Any) -> bool:
+        """Return whether ``token`` belongs to any retained session.
+
+        Unlike :meth:`authenticate`, this intentionally includes expired and
+        revoked sessions.  Callers use it to keep operator-session secrets out
+        of other authentication domains such as node enrollment.
+        """
+
+        if not _token_is_valid(token):
+            return False
+        digest = _token_digest(token)
+        with self._lock:
+            matched = False
+            for session in self._sessions.values():
+                if hmac.compare_digest(digest, session["_token_digest"]):
+                    matched = True
+            return matched
+
     def revoke(
         self,
         session_id: Any,

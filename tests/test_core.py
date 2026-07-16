@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import unittest
+from unittest.mock import patch
 
 from c2lab.core import (
     DEFAULT_QUEUE_TTL_SECONDS,
@@ -91,6 +92,147 @@ class LabStateTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, "result_conflict")
 
+    def test_terminal_result_retry_compares_json_types_strictly(self) -> None:
+        task = self.state.queue_task(
+            self.node["id"],
+            "GENERATE_EVENT",
+            {"category": "training", "severity": "info", "message": "strict retry"},
+        )
+        self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+        self.state.submit_result(
+            self.node["id"],
+            self.session_token,
+            task["id"],
+            "completed",
+            {
+                "recorded": True,
+                "category": "training",
+                "severity": "info",
+                "message": "strict retry",
+            },
+            now=11.1,
+        )
+
+        with self.assertRaises(LabError) as context:
+            self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                task["id"],
+                "completed",
+                {
+                    "recorded": 1,
+                    "category": "training",
+                    "severity": "info",
+                    "message": "strict retry",
+                },
+                now=11.2,
+            )
+        self.assertEqual(context.exception.code, "result_conflict")
+
+    def test_pruned_sleep_result_retry_uses_bounded_ack_tombstone(self) -> None:
+        with patch("c2lab.core.MAX_TASKS", 2):
+            task = self.state.queue_task(
+                self.node["id"],
+                "SLEEP",
+                {"interval_ms": 2_000, "jitter_percent": 0},
+            )
+            self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+            accepted = self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                task["id"],
+                "completed",
+                {
+                    "previous_interval_ms": 1_000,
+                    "new_interval_ms": 2_000,
+                    "jitter_percent": 0,
+                },
+                now=11.1,
+            )
+            self.state.queue_task(self.node["id"], "PING", {})
+            self.state.queue_task(self.node["id"], "PING", {})
+
+            self.assertNotIn(task["id"], {item["id"] for item in self.state.tasks()})
+            replay = self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                task["id"],
+                "completed",
+                {
+                    "previous_interval_ms": 1_000,
+                    "new_interval_ms": 2_000,
+                    "jitter_percent": 0,
+                },
+                now=11.2,
+            )
+            self.assertEqual(replay, accepted)
+            self.assertEqual(self.state.nodes()[0]["poll_interval_ms"], 2_000)
+            self.assertEqual(self.state.nodes()[0]["tasks_completed"], 1)
+
+            with self.assertRaises(LabError) as conflict:
+                self.state.submit_result(
+                    self.node["id"],
+                    self.session_token,
+                    task["id"],
+                    "completed",
+                    {
+                        "previous_interval_ms": 1_000,
+                        "new_interval_ms": 2_000,
+                        "jitter_percent": False,
+                    },
+                    now=11.3,
+                )
+            self.assertEqual(conflict.exception.code, "result_conflict")
+
+    def test_result_ack_tombstone_retention_is_bounded(self) -> None:
+        with (
+            patch("c2lab.core.MAX_TASKS", 1),
+            patch("c2lab.core.MAX_TASK_RESULT_TOMBSTONES", 1),
+        ):
+            first = self.state.queue_task(self.node["id"], "PING", {})
+            self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+            self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                first["id"],
+                "completed",
+                {"reply": "PONG"},
+                now=11.1,
+            )
+            second = self.state.queue_task(self.node["id"], "PING", {})
+            self.state.poll_node(self.node["id"], self.session_token, now=12.0)
+            accepted = self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                second["id"],
+                "completed",
+                {"reply": "PONG"},
+                now=12.1,
+            )
+            self.state.queue_task(self.node["id"], "PING", {})
+
+            with self.assertRaises(LabError) as evicted:
+                self.state.submit_result(
+                    self.node["id"],
+                    self.session_token,
+                    first["id"],
+                    "completed",
+                    {"reply": "PONG"},
+                    now=12.2,
+                )
+            self.assertEqual(evicted.exception.code, "not_found")
+            self.assertEqual(
+                self.state.submit_result(
+                    self.node["id"],
+                    self.session_token,
+                    second["id"],
+                    "completed",
+                    {"reply": "PONG"},
+                    now=12.3,
+                ),
+                accepted,
+            )
+
     def test_task_creation_idempotency_prevents_duplicate_queue_entries(self) -> None:
         key = "operator-request-0001"
         first = self.state.queue_task(
@@ -124,6 +266,47 @@ class LabStateTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.status, 409)
         self.assertEqual(context.exception.code, "idempotency_conflict")
+
+    def test_dispatch_fifo_uses_creation_sequence_when_wall_clock_moves_back(self) -> None:
+        with patch("c2lab.core.utc_now", return_value="2030-01-01T00:00:00.000Z"):
+            first = self.state.queue_task(self.node["id"], "PING", {})
+        with patch("c2lab.core.utc_now", return_value="2020-01-01T00:00:00.000Z"):
+            second = self.state.queue_task(self.node["id"], "PING", {})
+
+        polled = self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+        self.assertEqual(polled["task"]["id"], first["id"])
+        self.assertNotEqual(polled["task"]["id"], second["id"])
+
+    def test_retention_prunes_oldest_sequence_when_wall_clock_moves_back(self) -> None:
+        with patch("c2lab.core.MAX_TASKS", 2):
+            with patch("c2lab.core.utc_now", return_value="2030-01-01T00:00:00.000Z"):
+                first = self.state.queue_task(self.node["id"], "PING", {})
+            self.state.poll_node(self.node["id"], self.session_token, now=11.0)
+            self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                first["id"],
+                "completed",
+                {"reply": "PONG"},
+                now=11.1,
+            )
+            with patch("c2lab.core.utc_now", return_value="2020-01-01T00:00:00.000Z"):
+                second = self.state.queue_task(self.node["id"], "PING", {})
+            self.state.poll_node(self.node["id"], self.session_token, now=12.0)
+            self.state.submit_result(
+                self.node["id"],
+                self.session_token,
+                second["id"],
+                "completed",
+                {"reply": "PONG"},
+                now=12.1,
+            )
+
+            replacement = self.state.queue_task(self.node["id"], "PING", {})
+            retained_ids = {task["id"] for task in self.state.tasks()}
+            self.assertNotIn(first["id"], retained_ids)
+            self.assertIn(second["id"], retained_ids)
+            self.assertIn(replacement["id"], retained_ids)
 
     def test_task_records_creator_and_idempotency_is_actor_scoped(self) -> None:
         key = "operator-request-actor-0001"

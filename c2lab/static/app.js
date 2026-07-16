@@ -179,6 +179,8 @@ let renderedActorOptionsKey = "";
 let pendingTaskSubmission = null;
 let pendingNoteSubmission = null;
 let pendingExerciseSubmission = null;
+let openTaskDetailId = "";
+let renderedTaskDetailKey = "";
 let currentScenarioCatalog = FIXED_EXERCISE_SCENARIOS.map((scenario) => ({ ...scenario }));
 
 const tableTimeFormatter = new Intl.DateTimeFormat("ja-JP", {
@@ -212,9 +214,18 @@ function makeTextElement(tag, className, text) {
   return element;
 }
 
+function setText(element, value) {
+  const nextValue = String(value);
+  if (element.textContent !== nextValue) element.textContent = nextValue;
+}
+
+function unicodeLength(value) {
+  return Array.from(String(value)).length;
+}
+
 function setApiState(state, message) {
-  elements.apiState.dataset.state = state;
-  elements.apiStateText.textContent = message;
+  if (elements.apiState.dataset.state !== state) elements.apiState.dataset.state = state;
+  setText(elements.apiStateText, message);
 }
 
 function showToast(message, tone = "info") {
@@ -337,8 +348,8 @@ function renderOperatorSession(session) {
   currentPrincipalId = session.principal_id;
   currentRole = session.role;
   sessionPermissions = [...new Set(session.permissions)];
-  elements.operatorPrincipalId.textContent = currentPrincipalId;
-  elements.operatorRole.textContent = currentRole.toUpperCase();
+  setText(elements.operatorPrincipalId, currentPrincipalId);
+  setText(elements.operatorRole, currentRole.toUpperCase());
   elements.operatorPrincipalId.parentElement.dataset.state = "active";
   elements.operatorRole.parentElement.dataset.state = "active";
   elements.operatorRole.parentElement.dataset.role = currentRole;
@@ -348,8 +359,8 @@ function clearOperatorSession() {
   currentPrincipalId = "";
   currentRole = "";
   sessionPermissions = [];
-  elements.operatorPrincipalId.textContent = "—";
-  elements.operatorRole.textContent = "—";
+  setText(elements.operatorPrincipalId, "—");
+  setText(elements.operatorRole, "—");
   elements.operatorPrincipalId.parentElement.dataset.state = "unknown";
   elements.operatorRole.parentElement.dataset.state = "unknown";
   delete elements.operatorRole.parentElement.dataset.role;
@@ -768,7 +779,7 @@ function renderExercises(exercises, nodes, catalog) {
 }
 
 function setMetric(element, value) {
-  element.textContent = Number.isFinite(value) ? String(value) : "—";
+  setText(element, Number.isFinite(value) ? String(value) : "—");
 }
 
 function renderMetrics(counts = {}) {
@@ -951,21 +962,30 @@ function selectedNode() {
 
 function updateSelectedNodeSummary(node) {
   elements.selectedNodeSummary.dataset.state = node ? "selected" : "empty";
-  elements.selectedNodeName.textContent = node?.name || "Node 未選択";
-  elements.selectedNodeStatus.textContent = node ? String(node.status || "unknown").toUpperCase() : "—";
+  setText(elements.selectedNodeName, node?.name || "Node 未選択");
+  setText(
+    elements.selectedNodeStatus,
+    node ? String(node.status || "unknown").toUpperCase() : "—",
+  );
   elements.selectedNodeStatus.dataset.status = node?.status || "unknown";
-  elements.selectedNodeProfile.textContent = node?.profile || "—";
-  elements.selectedNodeSession.textContent = node
-    ? node.session_active === false
-      ? "CLOSED"
-      : node.tasking_paused
-        ? "TASKING PAUSED"
-        : "ACTIVE"
-    : "—";
+  setText(elements.selectedNodeProfile, node?.profile || "—");
+  setText(
+    elements.selectedNodeSession,
+    node
+      ? node.session_active === false
+        ? "CLOSED"
+        : node.tasking_paused
+          ? "TASKING PAUSED"
+          : "ACTIVE"
+      : "—",
+  );
   const capabilities = Array.isArray(node?.capabilities) ? node.capabilities : [];
-  elements.selectedNodeCapabilities.textContent = node
-    ? `固定タスク: ${capabilities.length ? capabilities.join(" · ") : "なし"}`
-    : "登録済みNodeを選択すると、実行可能な固定タスクを確認できます。";
+  setText(
+    elements.selectedNodeCapabilities,
+    node
+      ? `固定タスク: ${capabilities.length ? capabilities.join(" · ") : "なし"}`
+      : "登録済みNodeを選択すると、実行可能な固定タスクを確認できます。",
+  );
 
   for (const card of elements.nodeList.querySelectorAll(".node-card")) {
     card.classList.toggle("is-selected", Boolean(node) && card.dataset.nodeId === node.id);
@@ -1252,6 +1272,7 @@ function renderOverview(overview, eventHistory, auditHistory) {
   renderNodes(nodes);
   renderExerciseNodes(nodes);
   renderTasks(tasks, nodes);
+  refreshOpenTaskDetail(tasks, nodes);
   renderExercises(exercises, nodes, currentScenarioCatalog);
   renderHistory();
   elements.lastUpdated.textContent = `最終更新 ${updateTimeFormatter.format(new Date())}`;
@@ -1259,6 +1280,7 @@ function renderOverview(overview, eventHistory, auditHistory) {
 }
 
 function clearOverview() {
+  closeTaskDetail();
   setConnectedLayout(false);
   clearOperatorSession();
   resetSyncState();
@@ -1285,8 +1307,8 @@ function updateControls() {
     currentRole === "admin" && hasPermission("containment_write");
   const canReset = hasPermission("reset");
   const noteBusy = elements.noteSubmitButton.dataset.busy === "true";
-  const noteLength = elements.noteInput.value.length;
   const noteMessage = elements.noteInput.value.trim();
+  const noteLength = unicodeLength(noteMessage);
   const exerciseBusy = elements.createExerciseButton.dataset.busy === "true";
   const exerciseNode = selectedExerciseNode();
   const exerciseScenarioAllowed = EXERCISE_SCENARIO_IDS.has(
@@ -1345,7 +1367,7 @@ function updateControls() {
     elements.exercisePermissionHint.textContent =
       "固定シナリオだけをNode-private synthetic workspaceで開始します。";
   }
-  elements.noteCharacterCount.textContent = `${noteLength} / ${MAX_NOTE_LENGTH}`;
+  setText(elements.noteCharacterCount, `${noteLength} / ${MAX_NOTE_LENGTH}`);
   elements.noteCharacterCount.dataset.limit = noteLength > MAX_NOTE_LENGTH ? "exceeded" : "ok";
   elements.noteForm.dataset.permission = canWriteNotes ? "allowed" : "denied";
   if (!hasToken) {
@@ -1576,7 +1598,13 @@ function createTaskLifecycle(task) {
   return lifecycle;
 }
 
-function showTaskDetail(task, nodeName) {
+function renderTaskDetail(task, nodeName) {
+  const detailKey = JSON.stringify({ task, nodeName: nodeName || "" });
+  if (detailKey === renderedTaskDetailKey) {
+    updateControls();
+    return;
+  }
+  renderedTaskDetailKey = detailKey;
   elements.taskDetailBody.replaceChildren();
   elements.taskDetailBody.append(createTaskLifecycle(task));
   const grid = document.createElement("div");
@@ -1614,14 +1642,18 @@ function showTaskDetail(task, nodeName) {
         showToast("待機タスクの取消には task_write 権限が必要です。", "error");
         return;
       }
+      const requestGeneration = tokenGeneration;
+      const requestToken = operatorToken;
       cancelButton.dataset.busy = "true";
       updateControls();
       try {
         await api(`/lab/tasks/${task.id}/cancel`, { method: "POST", body: {} });
-        elements.taskDetailDialog.close();
+        if (requestIsStale(requestGeneration, requestToken)) return;
+        closeTaskDetail();
         showToast(`タスク ${task.id} を取り消しました。`, "success");
         await refresh({ silent: true });
       } catch (error) {
+        if (requestIsStale(requestGeneration, requestToken)) return;
         showToast(humanError(error), "error");
       } finally {
         delete cancelButton.dataset.busy;
@@ -1632,8 +1664,30 @@ function showTaskDetail(task, nodeName) {
     elements.taskDetailBody.append(actions);
     updateControls();
   }
+}
+
+function showTaskDetail(task, nodeName) {
+  openTaskDetailId = typeof task.id === "string" ? task.id : "";
+  renderedTaskDetailKey = "";
+  renderTaskDetail(task, nodeName);
+  if (!elements.taskDetailDialog.open) elements.taskDetailDialog.showModal();
+}
+
+function refreshOpenTaskDetail(tasks, nodes) {
+  if (!elements.taskDetailDialog.open || !openTaskDetailId) return;
+  const task = tasks.find((candidate) => candidate.id === openTaskDetailId);
+  if (!task) {
+    closeTaskDetail();
+    return;
+  }
+  const node = nodes.find((candidate) => candidate.id === task.node_id);
+  renderTaskDetail(task, node?.name);
+}
+
+function closeTaskDetail() {
+  openTaskDetailId = "";
+  renderedTaskDetailKey = "";
   if (elements.taskDetailDialog.open) elements.taskDetailDialog.close();
-  elements.taskDetailDialog.showModal();
 }
 
 function applyTaskTemplate() {
@@ -1677,7 +1731,8 @@ function readPayload() {
     exactPayloadKeys(payload, []);
   } else if (type === "ECHO_TEXT" || type === "HASH_TEXT") {
     exactPayloadKeys(payload, ["text"]);
-    if (typeof payload.text !== "string" || payload.text.trim().length < 1 || payload.text.trim().length > 240) {
+    const textLength = typeof payload.text === "string" ? unicodeLength(payload.text.trim()) : 0;
+    if (typeof payload.text !== "string" || textLength < 1 || textLength > 240) {
       throw new Error("text は1〜240文字にしてください。");
     }
   } else if (type === "WAIT") {
@@ -1693,7 +1748,10 @@ function readPayload() {
     if (!["info", "warning"].includes(payload.severity)) {
       throw new Error("severity は info / warning から選んでください。");
     }
-    if (typeof payload.message !== "string" || payload.message.trim().length < 1 || payload.message.trim().length > 240) {
+    const messageLength = typeof payload.message === "string"
+      ? unicodeLength(payload.message.trim())
+      : 0;
+    if (typeof payload.message !== "string" || messageLength < 1 || messageLength > 240) {
       throw new Error("message は1〜240文字にしてください。");
     }
   } else if (type === "SLEEP") {
@@ -1920,7 +1978,7 @@ elements.noteForm.addEventListener("submit", async (event) => {
     return;
   }
   const message = elements.noteInput.value.trim();
-  if (!message || message.length > MAX_NOTE_LENGTH) {
+  if (!message || unicodeLength(message) > MAX_NOTE_LENGTH) {
     showToast("メモは1〜240文字のplain textにしてください。", "error");
     elements.noteInput.focus();
     return;
@@ -1991,6 +2049,8 @@ elements.taskForm.addEventListener("submit", async (event) => {
     return;
   }
 
+  const requestGeneration = tokenGeneration;
+  const requestToken = operatorToken;
   await runWithBusyButton(elements.createTaskButton, "キューへ送信中…", async () => {
     const requestBody = {
       node_id: node.id,
@@ -2007,10 +2067,12 @@ elements.taskForm.addEventListener("submit", async (event) => {
         body: requestBody,
         idempotencyKey: pendingTaskSubmission.key,
       });
+      if (requestIsStale(requestGeneration, requestToken)) return;
       pendingTaskSubmission = null;
       showToast(`タスクを追加しました。相関ID: ${task.correlation_id}`, "success");
       await refresh({ silent: true });
     } catch (error) {
+      if (requestIsStale(requestGeneration, requestToken)) return;
       if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
         pendingTaskSubmission = null;
       }
@@ -2068,20 +2130,28 @@ elements.resetButton.addEventListener("click", async () => {
   );
   if (!confirmed) return;
 
+  const requestGeneration = tokenGeneration;
+  const requestToken = operatorToken;
   await runWithBusyButton(elements.resetButton, "リセット中…", async () => {
     try {
       await api("/lab/reset", { method: "POST", body: {} });
+      if (requestIsStale(requestGeneration, requestToken)) return;
       showToast("ラボをリセットしました。foreground Node は自動で再登録します。", "success");
       await refresh({ silent: true });
     } catch (error) {
+      if (requestIsStale(requestGeneration, requestToken)) return;
       showToast(humanError(error), "error");
     }
   });
 });
 
-elements.closeTaskDetailButton.addEventListener("click", () => elements.taskDetailDialog.close());
+elements.closeTaskDetailButton.addEventListener("click", closeTaskDetail);
 elements.taskDetailDialog.addEventListener("click", (event) => {
-  if (event.target === elements.taskDetailDialog) elements.taskDetailDialog.close();
+  if (event.target === elements.taskDetailDialog) closeTaskDetail();
+});
+elements.taskDetailDialog.addEventListener("close", () => {
+  openTaskDetailId = "";
+  renderedTaskDetailKey = "";
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -2094,12 +2164,7 @@ applyTaskTemplate();
 clearOverview();
 if (operatorToken) refresh();
 window.setInterval(() => {
-  const activeElement = document.activeElement;
-  const interacting = Boolean(
-    elements.taskDetailDialog.open ||
-    activeElement?.matches("input, select, textarea, summary"),
-  );
-  if (document.visibilityState === "visible" && !interacting) {
+  if (document.visibilityState === "visible") {
     refresh({ silent: true });
   }
 }, REFRESH_INTERVAL_MS);
