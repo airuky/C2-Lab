@@ -9,14 +9,26 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from .exercises import (
+    CONTAINMENT_ACTIONS,
+    MAX_EXERCISES,
+    MAX_EXERCISE_TIMELINE,
+    SCENARIO_IDS,
+    detections_for_playbook,
+    scenario_catalog,
+    scenario_definition,
+)
 from .protocol import (
+    MAX_JITTER_PERCENT,
     TASK_TYPES,
     ProtocolError,
     clean_text,
     validate_capabilities,
+    validate_jitter_percent,
     validate_poll_interval,
     validate_result,
     validate_task_result,
@@ -30,6 +42,10 @@ MAX_QUEUED_TASKS_PER_NODE = 50
 MAX_QUEUED_PLAYBOOKS_PER_NODE = 3
 MAX_EVENTS = 500
 MAX_AUDIT_ENTRIES = 500
+MAX_OPERATOR_NOTES_RETAINED = 100
+MAX_OPERATOR_NOTE_LENGTH = 240
+MAX_SYNC_CURSOR = 9_223_372_036_854_775_807
+MAX_SYNC_PAGE_SIZE = 100
 TASK_TIMEOUT_SECONDS = 8.0
 NODE_STALE_SECONDS = 8.0
 STALE_SESSION_TTL_SECONDS = 60.0
@@ -39,6 +55,8 @@ MIN_QUEUE_TTL_SECONDS = 5
 MAX_QUEUE_TTL_SECONDS = 86_400
 MIN_IDEMPOTENCY_KEY_LENGTH = 8
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
+DEFAULT_OPERATOR_ACTOR = "operator"
+MAX_OPERATOR_ACTOR_LENGTH = 48
 TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "timeout", "cancelled", "expired"}
 )
@@ -95,6 +113,37 @@ def _validate_idempotency_key(value: Any) -> str | None:
     return value
 
 
+def _validate_operator_actor(value: Any) -> str:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if not isinstance(value, str) or not 1 <= len(value) <= MAX_OPERATOR_ACTOR_LENGTH:
+        raise LabError(
+            f"actor must be 1 to {MAX_OPERATOR_ACTOR_LENGTH} characters"
+        )
+    if any(character not in allowed for character in value):
+        raise LabError("actor contains unsupported characters")
+    return value
+
+
+def _validate_sync_cursor(value: Any, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= MAX_SYNC_CURSOR
+    ):
+        raise LabError(f"{field} must be an integer from 0 to {MAX_SYNC_CURSOR}")
+    return value
+
+
+def _validate_sync_limit(value: Any) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= MAX_SYNC_PAGE_SIZE
+    ):
+        raise LabError(f"limit must be an integer from 1 to {MAX_SYNC_PAGE_SIZE}")
+    return value
+
+
 class LabState:
     """Thread-safe Teamserver state shared by operator and node API handlers."""
 
@@ -104,8 +153,12 @@ class LabState:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS)
         self._audit_entries: deque[dict[str, Any]] = deque(maxlen=MAX_AUDIT_ENTRIES)
+        self._note_idempotency: dict[str, tuple[str, str, str]] = {}
+        self._exercises: dict[str, dict[str, Any]] = {}
+        self._exercise_idempotency: dict[str, tuple[str, str, str, str]] = {}
         self._event_sequence = 0
         self._audit_sequence = 0
+        self._stream_id = f"stream-{secrets.token_hex(12)}"
 
     def _record_locked(
         self,
@@ -207,12 +260,14 @@ class LabState:
         capabilities: Any,
         poll_interval_ms: Any,
         *,
+        jitter_percent: Any = 0,
         now: float | None = None,
     ) -> dict[str, Any]:
         clean_name = _protocol_call(clean_text, name, "name", maximum=48)
         clean_version = _protocol_call(clean_text, version, "version", maximum=32)
         clean_capabilities = _protocol_call(validate_capabilities, profile, capabilities)
         clean_interval = _protocol_call(validate_poll_interval, poll_interval_ms)
+        clean_jitter = _protocol_call(validate_jitter_percent, jitter_percent)
         instant = time.monotonic() if now is None else now
 
         with self._lock:
@@ -250,6 +305,7 @@ class LabState:
                 "transport": "loopback-http-poll/v1",
                 "capabilities": clean_capabilities,
                 "poll_interval_ms": clean_interval,
+                "jitter_percent": clean_jitter,
                 "created_at": timestamp,
                 "last_seen": timestamp,
                 "tasks_completed": 0,
@@ -350,7 +406,7 @@ class LabState:
                 )
                 return {
                     "node": self._public_node(node),
-                    "task": self._public_task(active),
+                    "task": self._node_task(active),
                     "server_time": utc_now(),
                 }
 
@@ -386,7 +442,7 @@ class LabState:
                 )
             return {
                 "node": self._public_node(node),
-                "task": self._public_task(task) if task else None,
+                "task": self._node_task(task) if task else None,
                 "server_time": utc_now(),
             }
 
@@ -414,7 +470,7 @@ class LabState:
                 raise LabError(str(error), code="invalid_result") from error
             if task["status"] in {"completed", "failed"}:
                 if task["status"] == clean_status and task["result"] == clean_result:
-                    return self._public_task(task)
+                    return self._node_task(task)
                 raise LabError(
                     "task already has a different result",
                     code="result_conflict",
@@ -433,6 +489,7 @@ class LabState:
                         "version": node["version"],
                         "profile": node["profile"],
                         "poll_interval_ms": node["poll_interval_ms"],
+                        "jitter_percent": node.get("jitter_percent", 0),
                     },
                 )
             except ProtocolError as error:
@@ -449,6 +506,9 @@ class LabState:
                 node["tasks_completed"] += 1
             else:
                 node["tasks_failed"] += 1
+            if task["type"] == "SLEEP" and clean_status == "completed":
+                node["poll_interval_ms"] = clean_result["new_interval_ms"]
+                node["jitter_percent"] = clean_result["jitter_percent"]
             if task["type"] == "GENERATE_EVENT" and clean_status == "completed":
                 self._record_locked(
                     "node.generated_event",
@@ -481,7 +541,8 @@ class LabState:
                 to_state=clean_status,
                 outcome=clean_status,
             )
-            return self._public_task(task)
+            self._refresh_exercises_locked()
+            return self._node_task(task)
 
     def _fail_unfinished_tasks_locked(
         self,
@@ -526,6 +587,7 @@ class LabState:
                 outcome="failed",
                 reason=reason,
             )
+        self._refresh_exercises_locked()
 
     def disconnect_node(self, node_id: Any, session_token: Any) -> dict[str, Any]:
         with self._lock:
@@ -606,6 +668,7 @@ class LabState:
         *,
         queue_ttl_seconds: Any = _UNSET,
         idempotency_key: Any = None,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
         now: float | None = None,
     ) -> dict[str, Any]:
         if not isinstance(node_id, str):
@@ -617,6 +680,7 @@ class LabState:
             raise LabError(str(error), code=code) from error
         clean_ttl = _validate_queue_ttl(queue_ttl_seconds)
         clean_idempotency_key = _validate_idempotency_key(idempotency_key)
+        clean_actor = _validate_operator_actor(actor)
         instant = time.monotonic() if now is None else now
 
         with self._lock:
@@ -633,6 +697,7 @@ class LabState:
                     same_request = (
                         existing["node_id"] == node_id
                         and existing["type"] == clean_type
+                        and existing["created_by"] == clean_actor
                         and existing["payload"] == clean_payload
                         and existing["queue_ttl_seconds"] == clean_ttl
                     )
@@ -687,6 +752,7 @@ class LabState:
                 "correlation_id": f"corr-{uuid.uuid4().hex[:12]}",
                 "node_id": node_id,
                 "type": clean_type,
+                "created_by": clean_actor,
                 "payload": clean_payload,
                 "status": "queued",
                 "result": None,
@@ -704,12 +770,12 @@ class LabState:
                 "task.queued",
                 node_id=node_id,
                 task_id=task_id,
-                actor="operator",
+                actor=clean_actor,
                 data={"type": clean_type, "correlation_id": task["correlation_id"]},
             )
             self._audit_locked(
                 "task.queued",
-                actor="operator",
+                actor=clean_actor,
                 node_id=node_id,
                 task_id=task_id,
                 correlation_id=task["correlation_id"],
@@ -719,9 +785,15 @@ class LabState:
             )
             return self._public_task(task)
 
-    def cancel_task(self, task_id: Any) -> dict[str, Any]:
+    def cancel_task(
+        self,
+        task_id: Any,
+        *,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
+    ) -> dict[str, Any]:
         if not isinstance(task_id, str):
             raise LabError("task_id must be a string")
+        clean_actor = _validate_operator_actor(actor)
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
@@ -745,7 +817,7 @@ class LabState:
                 node_id=task["node_id"],
                 task_id=task["id"],
                 correlation_id=task["correlation_id"],
-                actor="operator",
+                actor=clean_actor,
                 data={
                     "type": task["type"],
                     "correlation_id": task["correlation_id"],
@@ -754,7 +826,7 @@ class LabState:
             )
             self._audit_locked(
                 "task.cancelled",
-                actor="operator",
+                actor=clean_actor,
                 node_id=task["node_id"],
                 task_id=task["id"],
                 correlation_id=task["correlation_id"],
@@ -764,6 +836,7 @@ class LabState:
                 outcome="cancelled",
                 reason="operator_cancelled",
             )
+            self._refresh_exercises_locked()
             return self._public_task(task)
 
     def expire(self, *, now: float | None = None) -> None:
@@ -883,16 +956,23 @@ class LabState:
                     outcome="success",
                     reason="offline_session_ttl_exceeded",
                 )
+        self._refresh_exercises_locked()
 
-    def reset(self) -> None:
+    def reset(self, *, actor: Any = DEFAULT_OPERATOR_ACTOR) -> None:
+        clean_actor = _validate_operator_actor(actor)
         with self._lock:
             self._nodes.clear()
             self._tasks.clear()
             self._events.clear()
-            self._record_locked("lab.reset", actor="operator", data={"sessions_invalidated": True})
+            self._note_idempotency.clear()
+            self._record_locked(
+                "lab.reset",
+                actor=clean_actor,
+                data={"sessions_invalidated": True},
+            )
             self._audit_locked(
                 "lab.reset",
-                actor="operator",
+                actor=clean_actor,
                 outcome="success",
                 reason="sessions_invalidated",
             )
@@ -921,6 +1001,169 @@ class LabState:
 
         with self._lock:
             return list(reversed(copy.deepcopy(list(self._audit_entries))))
+
+    def post_operator_note(
+        self,
+        message: Any,
+        *,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
+        idempotency_key: Any = None,
+    ) -> dict[str, Any]:
+        """Append a bounded plain-text collaboration note to the shared event feed."""
+
+        clean_actor = _validate_operator_actor(actor)
+        clean_message = _protocol_call(
+            clean_text,
+            message,
+            "message",
+            maximum=MAX_OPERATOR_NOTE_LENGTH,
+        )
+        clean_idempotency_key = _validate_idempotency_key(idempotency_key)
+        with self._lock:
+            if clean_idempotency_key is not None:
+                existing = self._note_idempotency.get(clean_idempotency_key)
+                if existing is not None:
+                    existing_actor, existing_message, event_id = existing
+                    if existing_actor != clean_actor or existing_message != clean_message:
+                        raise LabError(
+                            "Idempotency-Key was already used for a different note request",
+                            code="idempotency_conflict",
+                            status=409,
+                        )
+                    retained = next(
+                        (event for event in self._events if event["id"] == event_id),
+                        None,
+                    )
+                    if retained is not None:
+                        return copy.deepcopy(retained)
+                    del self._note_idempotency[clean_idempotency_key]
+
+            retained_notes = sum(
+                event["kind"] == "operator.note" for event in self._events
+            )
+            if retained_notes >= MAX_OPERATOR_NOTES_RETAINED:
+                raise LabError(
+                    "operator note retention limit reached",
+                    code="note_limit",
+                    status=429,
+                )
+            event = self._record_locked(
+                "operator.note",
+                actor=clean_actor,
+                data={"message": clean_message},
+            )
+            self._audit_locked(
+                "operator.note",
+                actor=clean_actor,
+                outcome="accepted",
+                reason="shared_event_feed",
+            )
+            if clean_idempotency_key is not None:
+                self._note_idempotency[clean_idempotency_key] = (
+                    clean_actor,
+                    clean_message,
+                    event["id"],
+                )
+                while len(self._note_idempotency) > MAX_OPERATOR_NOTES_RETAINED:
+                    self._note_idempotency.pop(next(iter(self._note_idempotency)))
+            return copy.deepcopy(event)
+
+    def sync(
+        self,
+        *,
+        events_after: Any = 0,
+        audit_after: Any = 0,
+        limit: Any = MAX_SYNC_PAGE_SIZE,
+    ) -> dict[str, Any]:
+        """Return current state plus cursor-based, retention-aware history deltas."""
+
+        clean_events_after = _validate_sync_cursor(events_after, "events_after")
+        clean_audit_after = _validate_sync_cursor(audit_after, "audit_after")
+        clean_limit = _validate_sync_limit(limit)
+        with self._lock:
+            nodes = self.nodes()
+            tasks = self.tasks()
+            retained_events = list(self._events)
+            retained_audit = list(self._audit_entries)
+
+            def history_delta(
+                retained: list[dict[str, Any]],
+                after: int,
+                latest: int,
+                *,
+                reset_floor: int | None = None,
+            ) -> tuple[list[dict[str, Any]], int, int, bool, bool]:
+                earliest = retained[0]["sequence"] if retained else latest + 1
+                reset_required = (
+                    after > latest
+                    or after < earliest - 1
+                    or (reset_floor is not None and after < reset_floor)
+                )
+                candidates = (
+                    retained
+                    if reset_required
+                    else [entry for entry in retained if entry["sequence"] > after]
+                )
+                selected = candidates[:clean_limit]
+                next_cursor = selected[-1]["sequence"] if selected else latest
+                return (
+                    copy.deepcopy(selected),
+                    next_cursor,
+                    earliest,
+                    reset_required,
+                    len(candidates) > len(selected),
+                )
+
+            reset_floor = next(
+                (
+                    event["sequence"]
+                    for event in retained_events
+                    if event["kind"] == "lab.reset"
+                ),
+                None,
+            )
+            events, next_events, oldest_event, reset_events, more_events = history_delta(
+                retained_events,
+                clean_events_after,
+                self._event_sequence,
+                reset_floor=reset_floor,
+            )
+            audit_entries, next_audit, oldest_audit, reset_audit, more_audit = history_delta(
+                retained_audit,
+                clean_audit_after,
+                self._audit_sequence,
+            )
+            return {
+                "generated_at": utc_now(),
+                "stream_id": self._stream_id,
+                "lab_mode": True,
+                "protocol": "loopback-http-poll/v1",
+                "counts": self._counts(nodes, tasks),
+                "nodes": nodes,
+                "tasks": tasks,
+                "events": events,
+                "audit": audit_entries,
+                "cursors": {
+                    "events": next_events,
+                    "audit": next_audit,
+                },
+                "high_watermarks": {
+                    "events": self._event_sequence,
+                    "audit": self._audit_sequence,
+                },
+                "oldest_available": {
+                    "events": oldest_event,
+                    "audit": oldest_audit,
+                },
+                "cursor_reset": {
+                    "events": reset_events,
+                    "audit": reset_audit,
+                },
+                "has_more": {
+                    "events": more_events,
+                    "audit": more_audit,
+                },
+            }
 
     @staticmethod
     def _counts(nodes: list[dict[str, Any]], tasks: list[dict[str, Any]]) -> dict[str, int]:
@@ -982,6 +1225,7 @@ class LabState:
                         "correlation_id",
                         "node_id",
                         "type",
+                        "created_by",
                         "status",
                         "created_at",
                         "queue_ttl_seconds",
@@ -997,6 +1241,9 @@ class LabState:
                 {
                     "events_retained": len(self._events),
                     "audit_retained": len(audit_entries),
+                    "operator_notes_retained": sum(
+                        event["kind"] == "operator.note" for event in self._events
+                    ),
                 }
             )
             return {
@@ -1009,6 +1256,9 @@ class LabState:
                     "tasks": MAX_TASKS,
                     "events": MAX_EVENTS,
                     "audit": MAX_AUDIT_ENTRIES,
+                    "operator_notes": MAX_OPERATOR_NOTES_RETAINED,
+                    "operator_note_length": MAX_OPERATOR_NOTE_LENGTH,
+                    "sync_page_size": MAX_SYNC_PAGE_SIZE,
                     "default_queue_ttl_seconds": DEFAULT_QUEUE_TTL_SECONDS,
                     "stale_session_ttl_seconds": STALE_SESSION_TTL_SECONDS,
                 },
@@ -1029,28 +1279,124 @@ class LabState:
     def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         return copy.deepcopy({key: value for key, value in task.items() if not key.startswith("_")})
 
+    @staticmethod
+    def _node_task(task: dict[str, Any]) -> dict[str, Any]:
+        """Project a task to the Node protocol without Operator-only attribution."""
+
+        return copy.deepcopy(
+            {
+                key: value
+                for key, value in task.items()
+                if not key.startswith("_") and key != "created_by"
+            }
+        )
+
 
 class LabRuntime:
     """Background expiry monitor; task execution occurs in separate node processes."""
 
-    def __init__(self, state: LabState, *, tick_seconds: float = 0.25) -> None:
+    def __init__(
+        self,
+        state: LabState,
+        *,
+        tick_seconds: float = 0.25,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.state = state
         self.tick_seconds = tick_seconds
+        self._clock = clock
         self._stop = threading.Event()
+        self._runtime_lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._status = "stopped"
+        self._ready = False
+        self._last_tick_at: float | None = None
+        self._last_error: str | None = None
+
+    @staticmethod
+    def _safe_error_type(error: BaseException) -> str:
+        name = type(error).__name__
+        if (
+            1 <= len(name) <= 64
+            and name.isascii()
+            and all(character.isalnum() or character == "_" for character in name)
+        ):
+            return name
+        return "Exception"
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="c2lab-teamserver-monitor", daemon=True)
-        self._thread.start()
+        with self._runtime_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._status = "running"
+            self._ready = False
+            self._last_tick_at = None
+            self._last_error = None
+            thread = threading.Thread(
+                target=self._run,
+                name="c2lab-teamserver-monitor",
+                daemon=True,
+            )
+            self._thread = thread
+            try:
+                thread.start()
+            except Exception as error:
+                self._thread = None
+                self._status = "stopped"
+                self._last_error = self._safe_error_type(error)
+                self._stop.set()
+                raise
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+        with self._runtime_lock:
+            self._stop.set()
+            self._status = "stopped"
+            self._ready = False
+            thread = self._thread
+        if (
+            thread
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=2)
+
+    def health(self) -> dict[str, Any]:
+        """Return a thread-safe, secret-free runtime readiness snapshot."""
+
+        with self._runtime_lock:
+            last_tick_age = (
+                None
+                if self._last_tick_at is None
+                else round(max(0.0, self._clock() - self._last_tick_at), 3)
+            )
+            tick_is_fresh = (
+                last_tick_age is not None
+                and last_tick_age <= max(1.0, self.tick_seconds * 4)
+            )
+            return {
+                "status": self._status,
+                "ready": self._status == "running" and self._ready and tick_is_fresh,
+                "last_tick_age_seconds": last_tick_age,
+                "last_error": self._last_error,
+            }
 
     def _run(self) -> None:
-        while not self._stop.wait(self.tick_seconds):
-            self.state.expire()
+        try:
+            while not self._stop.wait(self.tick_seconds):
+                self.state.expire()
+                tick_at = self._clock()
+                with self._runtime_lock:
+                    self._last_tick_at = tick_at
+                    if not self._stop.is_set() and self._status == "running":
+                        self._ready = True
+        except Exception as error:
+            with self._runtime_lock:
+                self._last_error = self._safe_error_type(error)
+                self._status = "stopped"
+                self._ready = False
+            self._stop.set()
+        finally:
+            with self._runtime_lock:
+                self._status = "stopped"
+                self._ready = False

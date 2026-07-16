@@ -52,6 +52,7 @@ class TaskResultContractTests(unittest.TestCase):
             "version": "0.3.0",
             "profile": "purple_lab",
             "poll_interval_ms": 500,
+            "jitter_percent": 0,
         }
         result = {
             **expected_runtime,
@@ -76,6 +77,34 @@ class TaskResultContractTests(unittest.TestCase):
                 {**result, "version": "forged"},
                 expected_runtime=expected_runtime,
             )
+
+    def test_sleep_result_must_match_requested_interval_and_jitter(self) -> None:
+        payload = {"interval_ms": 2000, "jitter_percent": 20}
+        valid = {"previous_interval_ms": 1000, "new_interval_ms": 2000, "jitter_percent": 20}
+        self.assertEqual(
+            validate_task_result("SLEEP", payload, "completed", valid),
+            ("completed", valid),
+        )
+        with self.assertRaises(ProtocolError):
+            validate_task_result(
+                "SLEEP", payload, "completed",
+                {"previous_interval_ms": 1000, "new_interval_ms": 999, "jitter_percent": 20},
+            )
+        with self.assertRaises(ProtocolError):
+            validate_task_result(
+                "SLEEP", payload, "completed",
+                {"previous_interval_ms": 1000, "new_interval_ms": 2000, "jitter_percent": 10},
+            )
+
+    def test_exit_result_must_be_acknowledged(self) -> None:
+        self.assertEqual(
+            validate_task_result("EXIT", {}, "completed", {"acknowledged": True}),
+            ("completed", {"acknowledged": True}),
+        )
+        with self.assertRaises(ProtocolError):
+            validate_task_result("EXIT", {}, "completed", {"acknowledged": False})
+        with self.assertRaises(ProtocolError):
+            validate_task_result("EXIT", {}, "completed", {})
 
     def test_failed_results_use_only_fixed_error_codes(self) -> None:
         for accepted in ("INVALID_TASK", "HANDLER_FAILED"):

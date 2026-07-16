@@ -66,7 +66,7 @@ class NodeExecutorTests(unittest.TestCase):
         self.assertEqual(status, "completed")
         self.assertEqual(
             set(result),
-            {"version", "profile", "uptime_ms", "tasks_completed", "poll_interval_ms"},
+            {"version", "profile", "uptime_ms", "tasks_completed", "poll_interval_ms", "jitter_percent"},
         )
         for forbidden in ("hostname", "username", "cwd", "pid", "environment", "interfaces"):
             self.assertNotIn(forbidden, result)
@@ -81,6 +81,36 @@ class NodeExecutorTests(unittest.TestCase):
         for task in invalid:
             with self.subTest(task=task):
                 status, result = self.executor.execute(task)
+                self.assertEqual(status, "failed")
+                self.assertEqual(result, {"error_code": "INVALID_TASK"})
+
+    def test_sleep_updates_executor_poll_state(self) -> None:
+        executor = NodeExecutor(version="0.2.0", profile="training", poll_interval_ms=1_000)
+        self.assertEqual(executor.poll_interval_ms, 1_000)
+        self.assertEqual(executor.jitter_percent, 0)
+        status, result = executor.execute(
+            {"type": "SLEEP", "payload": {"interval_ms": 2000, "jitter_percent": 30}}
+        )
+        self.assertEqual(status, "completed")
+        self.assertEqual(result["previous_interval_ms"], 1_000)
+        self.assertEqual(result["new_interval_ms"], 2000)
+        self.assertEqual(result["jitter_percent"], 30)
+        self.assertEqual(executor.poll_interval_ms, 2000)
+        self.assertEqual(executor.jitter_percent, 30)
+
+    def test_exit_returns_acknowledged(self) -> None:
+        status, result = self.executor.execute({"type": "EXIT", "payload": {}})
+        self.assertEqual(status, "completed")
+        self.assertEqual(result, {"acknowledged": True})
+
+    def test_basic_profile_rejects_sleep_and_exit(self) -> None:
+        executor = NodeExecutor(version="0.2.0", profile="basic", poll_interval_ms=1_000)
+        for task_type, payload in (
+            ("SLEEP", {"interval_ms": 500, "jitter_percent": 0}),
+            ("EXIT", {}),
+        ):
+            with self.subTest(task_type=task_type):
+                status, result = executor.execute({"type": task_type, "payload": payload})
                 self.assertEqual(status, "failed")
                 self.assertEqual(result, {"error_code": "INVALID_TASK"})
 
@@ -307,6 +337,8 @@ class NodeClientStateTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.reset_calls = 0
                 self.close_calls = 0
+                self.poll_interval_ms = 250
+                self.jitter_percent = 0
 
             def reset_lab_workspace(self) -> None:
                 self.reset_calls += 1

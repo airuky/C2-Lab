@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import random
 import threading
 import time
 import urllib.error
@@ -18,8 +19,11 @@ from urllib.parse import urlsplit
 
 from .lab_runtime import EphemeralLabWorkspace
 from .protocol import (
+    MAX_POLL_INTERVAL_MS,
+    MIN_POLL_INTERVAL_MS,
     ProtocolError,
     capabilities_for_profile,
+    validate_jitter_percent,
     validate_poll_interval,
     validate_profile,
     validate_result,
@@ -113,6 +117,7 @@ class NodeClient:
         version: str,
         profile: str,
         poll_interval_ms: int,
+        jitter_percent: int = 0,
     ) -> dict[str, Any]:
         capabilities = capabilities_for_profile(profile)
         payload = self._request(
@@ -123,6 +128,7 @@ class NodeClient:
                 "profile": profile,
                 "capabilities": capabilities,
                 "poll_interval_ms": poll_interval_ms,
+                "jitter_percent": jitter_percent,
             },
             authorization=f"Enroll {self.enrollment_token}",
         )
@@ -261,10 +267,11 @@ class NodeClient:
 class NodeExecutor:
     """Executes only the fixed, side-effect-bounded training action registry."""
 
-    def __init__(self, *, version: str, profile: str, poll_interval_ms: int) -> None:
+    def __init__(self, *, version: str, profile: str, poll_interval_ms: int, jitter_percent: int = 0) -> None:
         self.version = version
         self.profile = validate_profile(profile)
         self.poll_interval_ms = validate_poll_interval(poll_interval_ms)
+        self.jitter_percent = validate_jitter_percent(jitter_percent)
         self.started = time.monotonic()
         self.tasks_completed = 0
         self.lab_workspace = EphemeralLabWorkspace() if self.profile == "purple_lab" else None
@@ -300,6 +307,7 @@ class NodeExecutor:
                     "uptime_ms": int((time.monotonic() - self.started) * 1_000),
                     "tasks_completed": self.tasks_completed,
                     "poll_interval_ms": self.poll_interval_ms,
+                    "jitter_percent": self.jitter_percent,
                 }
             elif task_type == "ECHO_TEXT":
                 result = {"echo": payload["text"]}
@@ -311,6 +319,17 @@ class NodeExecutor:
             elif task_type == "WAIT":
                 time.sleep(payload["milliseconds"] / 1_000)
                 result = {"waited_ms": payload["milliseconds"]}
+            elif task_type == "SLEEP":
+                previous = self.poll_interval_ms
+                self.poll_interval_ms = payload["interval_ms"]
+                self.jitter_percent = payload["jitter_percent"]
+                result = {
+                    "previous_interval_ms": previous,
+                    "new_interval_ms": self.poll_interval_ms,
+                    "jitter_percent": self.jitter_percent,
+                }
+            elif task_type == "EXIT":
+                result = {"acknowledged": True}
             elif task_type == "RUN_PLAYBOOK":
                 if self.lab_workspace is None:
                     raise ProtocolError("playbook execution requires the purple_lab profile")
@@ -331,6 +350,17 @@ class NodeExecutor:
         return "completed", result
 
 
+def _jittered_wait(base_ms: int, jitter_percent: int, stop_event: threading.Event) -> None:
+    """Sleep with bounded random jitter, clamped to the poll-interval range."""
+
+    base = base_ms / 1_000
+    if jitter_percent > 0:
+        offset = base * jitter_percent / 100
+        base += random.uniform(-offset, offset)
+        base = max(MIN_POLL_INTERVAL_MS / 1_000, min(MAX_POLL_INTERVAL_MS / 1_000, base))
+    stop_event.wait(base)
+
+
 def run_node(
     *,
     controller_url: str,
@@ -339,6 +369,7 @@ def run_node(
     version: str,
     profile: str,
     poll_interval_ms: int,
+    jitter_percent: int = 0,
     stop_event: threading.Event | None = None,
 ) -> int:
     stop = stop_event or threading.Event()
@@ -347,9 +378,11 @@ def run_node(
         version=version,
         profile=profile,
         poll_interval_ms=poll_interval_ms,
+        jitter_percent=jitter_percent,
     )
 
-    print(f"C2 Lab Node '{name}' — profile={profile}, controller={client.controller_url}")
+    jitter_display = f", jitter={jitter_percent}%" if jitter_percent else ""
+    print(f"C2 Lab Node '{name}' — profile={profile}{jitter_display}, controller={client.controller_url}")
     print("Foreground lab process only. Press Ctrl-C to disconnect.")
     pending_result: dict[str, Any] | None = None
 
@@ -361,7 +394,8 @@ def run_node(
                         name=name,
                         version=version,
                         profile=profile,
-                        poll_interval_ms=poll_interval_ms,
+                        poll_interval_ms=executor.poll_interval_ms,
+                        jitter_percent=executor.jitter_percent,
                     )
                     print(f"Enrolled as {node['id']}")
                 except NodeClientError as error:
@@ -380,12 +414,20 @@ def run_node(
                         f"{pending_result['task_id']} {pending_result['task_type']} "
                         f"-> {pending_result['status']}"
                     )
+                    if pending_result["task_type"] == "SLEEP" and pending_result["status"] == "completed":
+                        print(
+                            f"  interval={executor.poll_interval_ms}ms "
+                            f"jitter={executor.jitter_percent}%"
+                        )
+                    if pending_result["task_type"] == "EXIT" and pending_result["status"] == "completed":
+                        print("EXIT received — shutting down.")
+                        stop.set()
                     pending_result = None
                 else:
                     response = client.poll()
                     task = response.get("task")
                     if not task:
-                        stop.wait(poll_interval_ms / 1_000)
+                        _jittered_wait(executor.poll_interval_ms, executor.jitter_percent, stop)
                         continue
                     status, result = executor.execute(task)
                     pending_result = {
@@ -406,7 +448,7 @@ def run_node(
                 else:
                     operation = "Result submission" if submitting_result else "Check-in"
                     print(f"{operation} failed; will retry: {error}")
-            stop.wait(poll_interval_ms / 1_000)
+            _jittered_wait(executor.poll_interval_ms, executor.jitter_percent, stop)
     except KeyboardInterrupt:
         print("\nStopping node…")
     finally:

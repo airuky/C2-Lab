@@ -3,4 +3,4 @@
 from .core import LabError, LabRuntime, LabState
 
 __all__ = ["LabError", "LabRuntime", "LabState"]
-__version__ = "0.4.0"
+__version__ = "0.6.0"

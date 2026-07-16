@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import unittest
 
 from c2lab.core import (
     DEFAULT_QUEUE_TTL_SECONDS,
     MAX_AUDIT_ENTRIES,
+    MAX_EVENTS,
+    MAX_OPERATOR_NOTE_LENGTH,
+    MAX_OPERATOR_NOTES_RETAINED,
     MAX_QUEUE_TTL_SECONDS,
     MAX_NODES,
     MAX_QUEUED_PLAYBOOKS_PER_NODE,
     MAX_QUEUED_TASKS_PER_NODE,
+    MAX_SYNC_CURSOR,
+    MAX_SYNC_PAGE_SIZE,
     MAX_TASKS,
     NODE_STALE_SECONDS,
     MIN_QUEUE_TTL_SECONDS,
@@ -49,6 +55,7 @@ class LabStateTests(unittest.TestCase):
         polled = self.state.poll_node(self.node["id"], self.session_token, now=11.0)
         self.assertEqual(polled["task"]["id"], queued["id"])
         self.assertEqual(polled["task"]["status"], "dispatched")
+        self.assertNotIn("created_by", polled["task"])
 
         finished = self.state.submit_result(
             self.node["id"],
@@ -61,6 +68,7 @@ class LabStateTests(unittest.TestCase):
         self.assertEqual(finished["status"], "completed")
         self.assertEqual(finished["result"], {"reply": "PONG"})
         self.assertTrue(finished["correlation_id"].startswith("corr-"))
+        self.assertNotIn("created_by", finished)
         self.assertEqual(self.state.nodes()[0]["tasks_completed"], 1)
 
     def test_identical_result_retry_is_idempotent(self) -> None:
@@ -117,6 +125,29 @@ class LabStateTests(unittest.TestCase):
         self.assertEqual(context.exception.status, 409)
         self.assertEqual(context.exception.code, "idempotency_conflict")
 
+    def test_task_records_creator_and_idempotency_is_actor_scoped(self) -> None:
+        key = "operator-request-actor-0001"
+        first = self.state.queue_task(
+            self.node["id"],
+            "PING",
+            {},
+            idempotency_key=key,
+            actor="operator-alpha",
+        )
+
+        self.assertEqual(first["created_by"], "operator-alpha")
+        self.assertEqual(self.state.tasks()[0]["created_by"], "operator-alpha")
+        with self.assertRaises(LabError) as context:
+            self.state.queue_task(
+                self.node["id"],
+                "PING",
+                {},
+                idempotency_key=key,
+                actor="operator-beta",
+            )
+        self.assertEqual(context.exception.status, 409)
+        self.assertEqual(context.exception.code, "idempotency_conflict")
+
     def test_queued_task_expires_but_dispatched_task_does_not(self) -> None:
         queued = self.state.queue_task(
             self.node["id"],
@@ -164,6 +195,278 @@ class LabStateTests(unittest.TestCase):
         with self.assertRaises(LabError) as context:
             self.state.cancel_task(active["id"])
         self.assertEqual(context.exception.code, "task_not_cancellable")
+
+    def test_operator_actions_record_actor_identity(self) -> None:
+        queued = self.state.queue_task(
+            self.node["id"],
+            "PING",
+            {},
+            actor="operator-primary",
+        )
+        self.state.cancel_task(queued["id"], actor="operator-admin")
+
+        queued_event = next(
+            event for event in self.state.events() if event["kind"] == "task.queued"
+        )
+        cancelled_event = next(
+            event for event in self.state.events() if event["kind"] == "task.cancelled"
+        )
+        self.assertEqual(queued_event["actor"], "operator-primary")
+        self.assertEqual(cancelled_event["actor"], "operator-admin")
+
+        self.state.reset(actor="viewer-a")
+        self.assertEqual(self.state.events()[0]["kind"], "lab.reset")
+        self.assertEqual(self.state.events()[0]["actor"], "viewer-a")
+        actors_by_action = {
+            entry["action"]: entry["actor"]
+            for entry in self.state.audit()
+            if entry["action"] in {"task.queued", "task.cancelled", "lab.reset"}
+        }
+        self.assertEqual(
+            actors_by_action,
+            {
+                "task.queued": "operator-primary",
+                "task.cancelled": "operator-admin",
+                "lab.reset": "viewer-a",
+            },
+        )
+
+    def test_operator_actor_validation_is_strict_and_non_mutating(self) -> None:
+        queued = self.state.queue_task(self.node["id"], "PING", {})
+        baseline_nodes = self.state.nodes()
+        baseline_tasks = self.state.tasks()
+        baseline_events = self.state.events()
+        baseline_audit = self.state.audit()
+
+        invalid_actors = (
+            "",
+            "a" * 49,
+            "operator primary",
+            "operator.primary",
+            "operator:primary",
+            "operator/primary",
+            "オペレーター",
+            None,
+            123,
+        )
+        for invalid_actor in invalid_actors:
+            with self.subTest(method="queue", actor=invalid_actor), self.assertRaises(LabError):
+                self.state.queue_task(
+                    self.node["id"],
+                    "PING",
+                    {},
+                    actor=invalid_actor,
+                )
+            with self.subTest(method="cancel", actor=invalid_actor), self.assertRaises(LabError):
+                self.state.cancel_task(queued["id"], actor=invalid_actor)
+            with self.subTest(method="reset", actor=invalid_actor), self.assertRaises(LabError):
+                self.state.reset(actor=invalid_actor)
+
+        self.assertEqual(self.state.nodes(), baseline_nodes)
+        self.assertEqual(self.state.tasks(), baseline_tasks)
+        self.assertEqual(self.state.events(), baseline_events)
+        self.assertEqual(self.state.audit(), baseline_audit)
+
+    def test_operator_notes_are_plain_text_attributed_and_audit_redacted(self) -> None:
+        marker = "handoff-note-not-for-audit"
+        note = self.state.post_operator_note(marker, actor="operator-alpha")
+
+        self.assertEqual(note["kind"], "operator.note")
+        self.assertEqual(note["actor"], "operator-alpha")
+        self.assertEqual(note["data"], {"message": marker})
+        note_audit = next(
+            entry for entry in self.state.audit() if entry["action"] == "operator.note"
+        )
+        self.assertEqual(note_audit["actor"], "operator-alpha")
+        self.assertNotIn(marker, json.dumps(note_audit))
+        report = self.state.report()
+        self.assertNotIn(marker, json.dumps(report))
+        self.assertEqual(report["counts"]["operator_notes_retained"], 1)
+        self.assertEqual(report["retention"]["operator_notes"], MAX_OPERATOR_NOTES_RETAINED)
+
+    def test_operator_note_idempotency_and_conflict(self) -> None:
+        key = "operator-note-request-0001"
+        first = self.state.post_operator_note(
+            "same note",
+            actor="operator-alpha",
+            idempotency_key=key,
+        )
+        replay = self.state.post_operator_note(
+            "same note",
+            actor="operator-alpha",
+            idempotency_key=key,
+        )
+
+        self.assertEqual(replay, first)
+        self.assertEqual(
+            len([event for event in self.state.events() if event["kind"] == "operator.note"]),
+            1,
+        )
+        self.assertEqual(
+            len([entry for entry in self.state.audit() if entry["action"] == "operator.note"]),
+            1,
+        )
+        for actor, message in (
+            ("operator-alpha", "different note"),
+            ("operator-beta", "same note"),
+        ):
+            with self.subTest(actor=actor, message=message), self.assertRaises(LabError) as context:
+                self.state.post_operator_note(
+                    message,
+                    actor=actor,
+                    idempotency_key=key,
+                )
+            self.assertEqual(context.exception.status, 409)
+            self.assertEqual(context.exception.code, "idempotency_conflict")
+
+    def test_operator_note_validation_is_non_mutating_and_bounded(self) -> None:
+        baseline_events = self.state.events()
+        baseline_audit = self.state.audit()
+        invalid_messages = ("", "   ", "x" * (MAX_OPERATOR_NOTE_LENGTH + 1), None, "bad\x00note")
+        for message in invalid_messages:
+            with self.subTest(message=message), self.assertRaises(LabError):
+                self.state.post_operator_note(message, actor="operator-alpha")
+        with self.assertRaises(LabError):
+            self.state.post_operator_note("valid", actor="operator alpha")
+        self.assertEqual(self.state.events(), baseline_events)
+        self.assertEqual(self.state.audit(), baseline_audit)
+
+        for index in range(MAX_OPERATOR_NOTES_RETAINED):
+            self.state.post_operator_note(
+                f"note {index}",
+                actor="operator-alpha",
+            )
+        with self.assertRaises(LabError) as context:
+            self.state.post_operator_note("one too many", actor="operator-alpha")
+        self.assertEqual(context.exception.status, 429)
+        self.assertEqual(context.exception.code, "note_limit")
+
+    def test_concurrent_operator_notes_have_unique_monotonic_sequences(self) -> None:
+        def append(index: int) -> dict[str, object]:
+            return self.state.post_operator_note(
+                f"concurrent note {index}",
+                actor=f"operator-{index % 4}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            notes = list(pool.map(append, range(32)))
+
+        sequences = [int(note["sequence"]) for note in notes]
+        self.assertEqual(len(sequences), len(set(sequences)))
+        retained_sequences = [
+            event["sequence"]
+            for event in reversed(self.state.events())
+            if event["kind"] == "operator.note"
+        ]
+        self.assertEqual(retained_sequences, sorted(sequences))
+
+    def test_sync_returns_atomic_snapshot_and_incremental_histories(self) -> None:
+        initial = self.state.sync()
+        self.assertRegex(initial["stream_id"], r"^stream-[0-9a-f]{24}$")
+        self.assertEqual(initial["nodes"], self.state.nodes())
+        self.assertEqual(initial["tasks"], [])
+        self.assertEqual(
+            [event["sequence"] for event in initial["events"]],
+            sorted(event["sequence"] for event in initial["events"]),
+        )
+        self.assertEqual(
+            [entry["sequence"] for entry in initial["audit"]],
+            sorted(entry["sequence"] for entry in initial["audit"]),
+        )
+        self.assertEqual(initial["cursors"], initial["high_watermarks"])
+        self.assertEqual(initial["cursor_reset"], {"events": False, "audit": False})
+
+        unchanged = self.state.sync(
+            events_after=initial["cursors"]["events"],
+            audit_after=initial["cursors"]["audit"],
+        )
+        self.assertEqual(unchanged["stream_id"], initial["stream_id"])
+        self.assertEqual(unchanged["events"], [])
+        self.assertEqual(unchanged["audit"], [])
+
+        queued = self.state.queue_task(
+            self.node["id"],
+            "PING",
+            {},
+            actor="operator-alpha",
+        )
+        delta = self.state.sync(
+            events_after=initial["cursors"]["events"],
+            audit_after=initial["cursors"]["audit"],
+        )
+        self.assertEqual(delta["tasks"][0]["id"], queued["id"])
+        self.assertEqual(delta["tasks"][0]["created_by"], "operator-alpha")
+        self.assertEqual([event["kind"] for event in delta["events"]], ["task.queued"])
+        self.assertEqual([entry["action"] for entry in delta["audit"]], ["task.queued"])
+
+        other_process = LabState().sync()
+        self.assertNotEqual(other_process["stream_id"], initial["stream_id"])
+
+    def test_sync_paginates_and_detects_retention_or_future_cursor_gaps(self) -> None:
+        with self.state._lock:
+            for index in range(MAX_EVENTS + 5):
+                self.state._record_locked("test.event", data={"index": index})
+
+        first = self.state.sync(events_after=0, audit_after=0, limit=10)
+        self.assertTrue(first["cursor_reset"]["events"])
+        self.assertTrue(first["has_more"]["events"])
+        self.assertEqual(len(first["events"]), 10)
+        self.assertGreater(first["oldest_available"]["events"], 1)
+        self.assertEqual(first["cursors"]["events"], first["events"][-1]["sequence"])
+
+        second = self.state.sync(
+            events_after=first["cursors"]["events"],
+            audit_after=first["cursors"]["audit"],
+            limit=10,
+        )
+        self.assertFalse(second["cursor_reset"]["events"])
+        self.assertEqual(
+            second["events"][0]["sequence"],
+            first["events"][-1]["sequence"] + 1,
+        )
+
+        future = self.state.sync(
+            events_after=MAX_SYNC_CURSOR,
+            audit_after=MAX_SYNC_CURSOR,
+            limit=MAX_SYNC_PAGE_SIZE,
+        )
+        self.assertEqual(future["cursor_reset"], {"events": True, "audit": True})
+
+    def test_sync_validates_cursor_and_limit_without_mutation(self) -> None:
+        baseline = self.state.sync()
+        baseline.pop("generated_at")
+        invalid_calls = (
+            {"events_after": -1},
+            {"events_after": True},
+            {"events_after": "1"},
+            {"events_after": MAX_SYNC_CURSOR + 1},
+            {"audit_after": -1},
+            {"limit": 0},
+            {"limit": MAX_SYNC_PAGE_SIZE + 1},
+            {"limit": True},
+        )
+        for arguments in invalid_calls:
+            with self.subTest(arguments=arguments), self.assertRaises(LabError):
+                self.state.sync(**arguments)
+        after = self.state.sync()
+        after.pop("generated_at")
+        self.assertEqual(after, baseline)
+
+    def test_sync_requires_event_history_replacement_across_lab_reset(self) -> None:
+        before_reset = self.state.sync()
+        prior_event_cursor = before_reset["cursors"]["events"]
+        prior_audit_cursor = before_reset["cursors"]["audit"]
+
+        self.state.reset(actor="operator-admin")
+        after_reset = self.state.sync(
+            events_after=prior_event_cursor,
+            audit_after=prior_audit_cursor,
+        )
+
+        self.assertTrue(after_reset["cursor_reset"]["events"])
+        self.assertFalse(after_reset["cursor_reset"]["audit"])
+        self.assertEqual([event["kind"] for event in after_reset["events"]], ["lab.reset"])
+        self.assertEqual([entry["action"] for entry in after_reset["audit"]], ["lab.reset"])
 
     def test_queue_controls_validate_bounds_and_default(self) -> None:
         defaulted = self.state.queue_task(self.node["id"], "PING", {}, now=20.0)
@@ -445,6 +748,7 @@ class LabStateTests(unittest.TestCase):
         self.assertNotIn("payload", report_task)
         self.assertNotIn("result", report_task)
         self.assertEqual(report_task["correlation_id"], task["correlation_id"])
+        self.assertEqual(report_task["created_by"], "operator")
 
         self.state.reset()
         self.assertIn("task.completed", {entry["action"] for entry in self.state.audit()})

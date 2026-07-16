@@ -106,7 +106,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("node-card__select", self.javascript)
         self.assertIn("task.correlation_id", self.javascript)
         self.assertIn("event.actor", self.javascript)
-        self.assertIn('api("/lab/audit")', self.javascript)
+        self.assertIn("/lab/sync?events_after=", self.javascript)
         self.assertIn("auditEntryAsEvent", self.javascript)
         self.assertNotIn("hostname", self.html + self.javascript)
 
@@ -128,6 +128,73 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(f'<option value="{status}">', self.html)
             self.assertIn(f'data-status="{status}"', self.styles)
             self.assertIn(status, self.javascript)
+
+    def test_operator_session_and_rbac_controls_are_present(self) -> None:
+        for element_id in ("operatorPrincipalId", "operatorRole"):
+            self.assertIn(f'id="{element_id}"', self.html)
+        self.assertIn('api("/lab/session")', self.javascript)
+        self.assertIn(
+            "const needsSession = sessionGeneration !== requestGeneration;",
+            self.javascript,
+        )
+        self.assertIn(
+            'const sessionRequest = needsSession ? api("/lab/session") : Promise.resolve(null);',
+            self.javascript,
+        )
+        self.assertIn("let sessionPermissions = [];", self.javascript)
+        self.assertIn('hasPermission("task_write")', self.javascript)
+        self.assertIn('hasPermission("note_write")', self.javascript)
+        self.assertIn('hasPermission("reset")', self.javascript)
+        self.assertIn("error.status === 403", self.javascript)
+        self.assertIn('data-task-cancel', self.javascript)
+        self.assertNotIn("session.token", self.javascript)
+        self.assertIn('.session-fact[data-state="active"]', self.styles)
+
+    def test_dashboard_uses_bounded_cursor_delta_sync(self) -> None:
+        for declaration in (
+            "const SYNC_PAGE_SIZE = 100;",
+            "const MAX_SYNC_PAGES = 10;",
+            "const MAX_HISTORY_RECORDS = 500;",
+            'let syncStreamId = "";',
+            "let syncCursors = { events: 0, audit: 0 };",
+            "let retainedHistory = { events: [], audit: [] };",
+        ):
+            self.assertIn(declaration, self.javascript)
+        self.assertIn(
+            "for (let pageIndex = 0; pageIndex < MAX_SYNC_PAGES; pageIndex += 1)",
+            self.javascript,
+        )
+        self.assertIn("page.cursor_reset.events", self.javascript)
+        self.assertIn("page.cursor_reset.audit", self.javascript)
+        self.assertIn("page.stream_id !== nextStreamId", self.javascript)
+        self.assertIn("nextCursors = { events: 0, audit: 0 };", self.javascript)
+        self.assertIn("nextHistory = { events: [], audit: [] };", self.javascript)
+        self.assertIn("page.has_more.events", self.javascript)
+        self.assertIn("page.has_more.audit", self.javascript)
+        self.assertIn(".slice(-MAX_HISTORY_RECORDS)", self.javascript)
+        self.assertIn("requestIsStale(requestGeneration, requestToken)", self.javascript)
+        self.assertNotIn('api("/lab/overview")', self.javascript)
+        self.assertNotIn('api("/lab/audit")', self.javascript)
+
+    def test_operator_notes_and_task_attribution_are_present(self) -> None:
+        for element_id in (
+            "noteForm",
+            "noteInput",
+            "notePermissionHint",
+            "noteCharacterCount",
+            "noteSubmitButton",
+        ):
+            self.assertIn(f'id="{element_id}"', self.html)
+        self.assertRegex(self.html, r'id="noteInput"[\s\S]+?maxlength="240"')
+        self.assertIn('api("/lab/notes", {', self.javascript)
+        self.assertIn('body: { message },', self.javascript)
+        self.assertIn("pendingNoteSubmission", self.javascript)
+        self.assertIn('event.kind === "operator.note"', self.javascript)
+        self.assertIn("CREATED BY", self.html)
+        self.assertIn("task.created_by", self.javascript)
+        self.assertIn('addDetailValue(grid, "Created by", task.created_by);', self.javascript)
+        self.assertIn(".operator-note", self.styles)
+        self.assertIn(".task-table th:nth-child(8)", self.styles)
 
     def test_token_refresh_races_and_busy_connect_button_are_guarded(self) -> None:
         self.assertIn("tokenGeneration", self.javascript)

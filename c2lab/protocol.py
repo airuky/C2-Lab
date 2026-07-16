@@ -13,6 +13,7 @@ MAX_TEXT_LENGTH = 240
 MAX_WAIT_MS = 2_000
 MIN_POLL_INTERVAL_MS = 250
 MAX_POLL_INTERVAL_MS = 3_000
+MAX_JITTER_PERCENT = 50
 MAX_RESULT_BYTES = 4_096
 NODE_FAILURE_CODES = ("INVALID_TASK", "HANDLER_FAILED")
 
@@ -23,6 +24,8 @@ TRAINING_TASK_TYPES = (
     "HASH_TEXT",
     "WAIT",
     "GENERATE_EVENT",
+    "SLEEP",
+    "EXIT",
 )
 TASK_TYPES = TRAINING_TASK_TYPES + ("RUN_PLAYBOOK",)
 
@@ -93,6 +96,14 @@ def validate_poll_interval(value: Any) -> int:
     return value
 
 
+def validate_jitter_percent(value: Any) -> int:
+    if not is_int(value) or not 0 <= value <= MAX_JITTER_PERCENT:
+        raise ProtocolError(
+            f"jitter_percent must be an integer from 0 to {MAX_JITTER_PERCENT}"
+        )
+    return value
+
+
 def validate_task_payload(task_type: Any, payload: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(task_type, str) or task_type not in TASK_TYPES:
         raise ProtocolError(f"task type must be one of: {', '.join(TASK_TYPES)}")
@@ -113,6 +124,21 @@ def validate_task_payload(task_type: Any, payload: Any) -> tuple[str, dict[str, 
         if not is_int(milliseconds) or not 0 <= milliseconds <= MAX_WAIT_MS:
             raise ProtocolError(f"milliseconds must be an integer from 0 to {MAX_WAIT_MS}")
         return task_type, {"milliseconds": milliseconds}
+
+    if task_type == "SLEEP":
+        exact_keys(payload, {"interval_ms", "jitter_percent"})
+        interval = payload["interval_ms"]
+        if not is_int(interval) or not MIN_POLL_INTERVAL_MS <= interval <= MAX_POLL_INTERVAL_MS:
+            raise ProtocolError(
+                f"interval_ms must be an integer from {MIN_POLL_INTERVAL_MS} to {MAX_POLL_INTERVAL_MS}"
+            )
+        jitter = payload["jitter_percent"]
+        validate_jitter_percent(jitter)
+        return task_type, {"interval_ms": interval, "jitter_percent": jitter}
+
+    if task_type == "EXIT":
+        exact_keys(payload, set())
+        return task_type, {}
 
     if task_type == "RUN_PLAYBOOK":
         exact_keys(payload, {"playbook"})
@@ -179,13 +205,14 @@ def validate_task_result(
     if task_type == "RUNTIME_STATUS":
         exact_keys(
             clean_result,
-            {"version", "profile", "uptime_ms", "tasks_completed", "poll_interval_ms"},
+            {"version", "profile", "uptime_ms", "tasks_completed", "poll_interval_ms", "jitter_percent"},
         )
         version = clean_text(clean_result["version"], "version", maximum=32)
         profile = validate_profile(clean_result["profile"])
         uptime_ms = clean_result["uptime_ms"]
         tasks_completed = clean_result["tasks_completed"]
         poll_interval_ms = validate_poll_interval(clean_result["poll_interval_ms"])
+        jitter_percent = validate_jitter_percent(clean_result["jitter_percent"])
         if not is_int(uptime_ms) or not 0 <= uptime_ms <= 2**53 - 1:
             raise ProtocolError("uptime_ms must be a non-negative safe integer")
         if not is_int(tasks_completed) or not 0 <= tasks_completed <= 1_000_000:
@@ -194,6 +221,7 @@ def validate_task_result(
             version != expected_runtime.get("version")
             or profile != expected_runtime.get("profile")
             or poll_interval_ms != expected_runtime.get("poll_interval_ms")
+            or jitter_percent != expected_runtime.get("jitter_percent", 0)
         ):
             raise ProtocolError("runtime identity fields do not match the enrolled node")
         return clean_status, {
@@ -202,6 +230,7 @@ def validate_task_result(
             "uptime_ms": uptime_ms,
             "tasks_completed": tasks_completed,
             "poll_interval_ms": poll_interval_ms,
+            "jitter_percent": jitter_percent,
         }
 
     if task_type == "ECHO_TEXT":
@@ -224,6 +253,35 @@ def validate_task_result(
         if clean_result != expected:
             raise ProtocolError("WAIT result must match the bounded wait request")
         return clean_status, expected
+
+    if task_type == "SLEEP":
+        exact_keys(
+            clean_result,
+            {"previous_interval_ms", "new_interval_ms", "jitter_percent"},
+        )
+        prev = clean_result["previous_interval_ms"]
+        new = clean_result["new_interval_ms"]
+        jitter = clean_result["jitter_percent"]
+        if not is_int(prev) or not MIN_POLL_INTERVAL_MS <= prev <= MAX_POLL_INTERVAL_MS:
+            raise ProtocolError("previous_interval_ms is outside the supported range")
+        if not is_int(new) or not MIN_POLL_INTERVAL_MS <= new <= MAX_POLL_INTERVAL_MS:
+            raise ProtocolError("new_interval_ms is outside the supported range")
+        if new != task_payload["interval_ms"]:
+            raise ProtocolError("new_interval_ms must match the requested interval")
+        if not is_int(jitter) or not 0 <= jitter <= MAX_JITTER_PERCENT:
+            raise ProtocolError("jitter_percent is outside the supported range")
+        if jitter != task_payload["jitter_percent"]:
+            raise ProtocolError("jitter_percent must match the requested jitter")
+        return clean_status, {
+            "previous_interval_ms": prev,
+            "new_interval_ms": new,
+            "jitter_percent": jitter,
+        }
+
+    if task_type == "EXIT":
+        if clean_result != {"acknowledged": True}:
+            raise ProtocolError("EXIT result must be the fixed acknowledgement")
+        return clean_status, {"acknowledged": True}
 
     if task_type == "GENERATE_EVENT":
         expected = {

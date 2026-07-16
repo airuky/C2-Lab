@@ -3,6 +3,38 @@
 const TOKEN_KEY = "c2lab.operator-token";
 const REFRESH_INTERVAL_MS = 3000;
 const MAX_EVENT_ROWS = 100;
+const SYNC_PAGE_SIZE = 100;
+const MAX_SYNC_PAGES = 10;
+const MAX_HISTORY_RECORDS = 500;
+const MAX_NOTE_LENGTH = 240;
+const FIXED_EXERCISE_SCENARIOS = Object.freeze([
+  Object.freeze({
+    id: "DISCOVERY_COLLECTION",
+    title: "DISCOVERY_COLLECTION",
+    description: "同期カタログ取得後にシナリオ説明を表示します。",
+    techniques: [],
+  }),
+  Object.freeze({
+    id: "CANARY_REMOVAL",
+    title: "CANARY_REMOVAL",
+    description: "同期カタログ取得後にシナリオ説明を表示します。",
+    techniques: [],
+  }),
+]);
+const EXERCISE_SCENARIO_IDS = new Set(
+  FIXED_EXERCISE_SCENARIOS.map((scenario) => scenario.id),
+);
+const CONTAINMENT_ACTIONS = new Set([
+  "CANCEL_REMAINING",
+  "INVALIDATE_NODE_SESSION",
+]);
+const TERMINAL_EXERCISE_STATUSES = new Set([
+  "completed",
+  "complete",
+  "failed",
+  "cancelled",
+  "contained",
+]);
 
 const TASK_TEMPLATES = Object.freeze({
   PING: {
@@ -33,6 +65,14 @@ const TASK_TEMPLATES = Object.freeze({
     },
     hint: "category は training / telemetry / policy、severity は info / warning です。",
   },
+  SLEEP: {
+    payload: { interval_ms: 2000, jitter_percent: 20 },
+    hint: "Node の poll 間隔とジッターを変更します。CS の sleep コマンドに相当します。",
+  },
+  EXIT: {
+    payload: {},
+    hint: "Node に正常停止を指示します。CS の exit コマンドに相当します。",
+  },
   RUN_PLAYBOOK: {
     payload: { playbook: "DISCOVERY_FIXTURES" },
     hint: "purple_lab Node 専用です。Node自身の一時workspaceだけで固定playbookを実行し、実I/Oの証跡を返します。",
@@ -53,6 +93,8 @@ const elementIds = [
   "clearTokenButton",
   "labModeValue",
   "protocolValue",
+  "operatorPrincipalId",
+  "operatorRole",
   "lastUpdated",
   "metricGrid",
   "metricNodesOnline",
@@ -89,11 +131,26 @@ const elementIds = [
   "tasksEmpty",
   "tasksEmptyTitle",
   "tasksEmptyDescription",
+  "exerciseForm",
+  "exerciseNodeSelect",
+  "exerciseScenarioSelect",
+  "exerciseScenarioHint",
+  "exerciseTechniqueList",
+  "exercisePermissionHint",
+  "createExerciseButton",
+  "exerciseCountBadge",
+  "exerciseList",
+  "exercisesEmpty",
   "eventCountBadge",
   "activitySourceFilter",
   "eventSearchInput",
   "eventLevelFilter",
   "eventActorFilter",
+  "noteForm",
+  "noteInput",
+  "notePermissionHint",
+  "noteCharacterCount",
+  "noteSubmitButton",
   "eventList",
   "eventsEmpty",
   "eventsEmptyTitle",
@@ -110,13 +167,26 @@ const elements = Object.fromEntries(
 
 let operatorToken = "";
 let tokenGeneration = 0;
+let currentPrincipalId = "";
+let currentRole = "";
+let sessionPermissions = [];
+let sessionGeneration = -1;
+let syncStreamId = "";
+let syncCursors = { events: 0, audit: 0 };
+let retainedHistory = { events: [], audit: [] };
 let latestOverview = null;
 let refreshInFlight = false;
 let renderedNodeKey = "";
 let renderedTaskKey = "";
+let renderedExerciseCatalogKey = "";
+let renderedExerciseNodeKey = "";
+let renderedExerciseKey = "";
 let renderedHistoryKey = "";
 let renderedActorOptionsKey = "";
 let pendingTaskSubmission = null;
+let pendingNoteSubmission = null;
+let pendingExerciseSubmission = null;
+let currentScenarioCatalog = FIXED_EXERCISE_SCENARIOS.map((scenario) => ({ ...scenario }));
 
 const tableTimeFormatter = new Intl.DateTimeFormat("ja-JP", {
   month: "2-digit",
@@ -206,7 +276,10 @@ function compactJson(value) {
 
 function humanError(error) {
   if (error instanceof ApiError && error.status === 401) {
-    return "Operator token が無効です。Teamserver が表示したURLを開き直してください。";
+    return "Operator session が無効または期限切れです。期限切れの場合はTeamserverを再起動し、新しいURLを開いてください。";
+  }
+  if (error instanceof ApiError && error.status === 403) {
+    return "このOperatorには操作権限がありません。現在のroleとpermissionsを確認してください。";
   }
   if (error instanceof TypeError) {
     return "Teamserver に接続できません。localhost で起動しているか確認してください。";
@@ -249,6 +322,446 @@ async function api(path, { method = "GET", body, idempotencyKey } = {}) {
     );
   }
   return payload;
+}
+
+function hasPermission(permission) {
+  return sessionPermissions.includes(permission);
+}
+
+function renderOperatorSession(session) {
+  if (
+    !session ||
+    typeof session.principal_id !== "string" ||
+    !session.principal_id ||
+    typeof session.role !== "string" ||
+    !session.role ||
+    !Array.isArray(session.permissions) ||
+    session.permissions.some((permission) => typeof permission !== "string")
+  ) {
+    throw new ApiError("Operator session 情報が不正なため接続を拒否しました。");
+  }
+
+  currentPrincipalId = session.principal_id;
+  currentRole = session.role;
+  sessionPermissions = [...new Set(session.permissions)];
+  elements.operatorPrincipalId.textContent = currentPrincipalId;
+  elements.operatorRole.textContent = currentRole.toUpperCase();
+  elements.operatorPrincipalId.parentElement.dataset.state = "active";
+  elements.operatorRole.parentElement.dataset.state = "active";
+  elements.operatorRole.parentElement.dataset.role = currentRole;
+}
+
+function clearOperatorSession() {
+  currentPrincipalId = "";
+  currentRole = "";
+  sessionPermissions = [];
+  elements.operatorPrincipalId.textContent = "—";
+  elements.operatorRole.textContent = "—";
+  elements.operatorPrincipalId.parentElement.dataset.state = "unknown";
+  elements.operatorRole.parentElement.dataset.state = "unknown";
+  delete elements.operatorRole.parentElement.dataset.role;
+}
+
+function resetSyncState() {
+  sessionGeneration = -1;
+  syncStreamId = "";
+  syncCursors = { events: 0, audit: 0 };
+  retainedHistory = { events: [], audit: [] };
+}
+
+function requestIsStale(requestGeneration, requestToken) {
+  return requestGeneration !== tokenGeneration || requestToken !== operatorToken;
+}
+
+function syncCounter(group, key, label) {
+  const value = group?.[key];
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ApiError(`${label}.${key} が不正な同期応答を拒否しました。`);
+  }
+  return value;
+}
+
+function validateSyncPage(page) {
+  if (
+    !page ||
+    page.lab_mode !== true ||
+    typeof page.stream_id !== "string" ||
+    !/^stream-[0-9a-f]{24}$/.test(page.stream_id) ||
+    !Array.isArray(page.nodes) ||
+    !Array.isArray(page.tasks) ||
+    !Array.isArray(page.exercises) ||
+    (page.scenario_catalog !== undefined && !Array.isArray(page.scenario_catalog)) ||
+    !Array.isArray(page.events) ||
+    !Array.isArray(page.audit)
+  ) {
+    throw new ApiError("localhost lab_mode を確認できない同期応答を拒否しました。");
+  }
+
+  for (const groupName of ["cursors", "high_watermarks", "oldest_available"]) {
+    syncCounter(page[groupName], "events", groupName);
+    syncCounter(page[groupName], "audit", groupName);
+  }
+  for (const groupName of ["cursor_reset", "has_more"]) {
+    if (
+      typeof page[groupName]?.events !== "boolean" ||
+      typeof page[groupName]?.audit !== "boolean"
+    ) {
+      throw new ApiError(`${groupName} が不正な同期応答を拒否しました。`);
+    }
+  }
+  for (const [historyName, records] of [
+    ["events", page.events],
+    ["audit", page.audit],
+  ]) {
+    let previousSequence = 0;
+    for (const record of records) {
+      if (
+        !record ||
+        !Number.isSafeInteger(record.sequence) ||
+        record.sequence < 1 ||
+        record.sequence <= previousSequence
+      ) {
+        throw new ApiError(`${historyName} が昇順でない同期応答を拒否しました。`);
+      }
+      previousSequence = record.sequence;
+    }
+  }
+  return page;
+}
+
+function syncPath(cursors) {
+  return `/lab/sync?events_after=${cursors.events}&audit_after=${cursors.audit}&limit=${SYNC_PAGE_SIZE}`;
+}
+
+function mergeHistoryRecords(existing, incoming, reset = false) {
+  const bySequence = new Map();
+  if (!reset) {
+    for (const record of existing) bySequence.set(record.sequence, record);
+  }
+  for (const record of incoming) bySequence.set(record.sequence, record);
+  return Array.from(bySequence.values())
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-MAX_HISTORY_RECORDS);
+}
+
+function recordText(record, ...keys) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return "";
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
+}
+
+function techniqueLabel(technique) {
+  if (typeof technique === "string") return technique.trim();
+  if (!technique || typeof technique !== "object" || Array.isArray(technique)) return "";
+  const id = recordText(technique, "id", "technique_id");
+  const name = recordText(technique, "name", "title");
+  if (id && name && id !== name) return `${id} · ${name}`;
+  return id || name;
+}
+
+function techniqueLabels(techniques) {
+  if (!Array.isArray(techniques)) return [];
+  return Array.from(new Set(techniques.map(techniqueLabel).filter(Boolean))).slice(0, 32);
+}
+
+function normalizeScenarioCatalog(catalog) {
+  const byId = new Map();
+  for (const entry of Array.isArray(catalog) ? catalog : []) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const id = recordText(entry, "id", "scenario_id");
+    if (!EXERCISE_SCENARIO_IDS.has(id)) continue;
+    byId.set(id, {
+      id,
+      title: recordText(entry, "title", "name") || id,
+      description:
+        recordText(entry, "description", "summary") ||
+        "固定シナリオの検知timelineを観察します。",
+      techniques: techniqueLabels(entry.techniques || entry.attack_techniques),
+    });
+  }
+  return FIXED_EXERCISE_SCENARIOS.map((fallback) => ({
+    ...fallback,
+    ...(byId.get(fallback.id) || {}),
+  }));
+}
+
+function renderTechniqueList(container, techniques, emptyText = "CATALOG PENDING") {
+  container.replaceChildren();
+  const labels = techniqueLabels(techniques);
+  if (labels.length === 0) {
+    container.append(makeTextElement("span", "technique-chip technique-chip--empty", emptyText));
+    return;
+  }
+  for (const label of labels) {
+    container.append(makeTextElement("span", "technique-chip", label));
+  }
+}
+
+function updateExerciseScenarioSummary() {
+  const selected = currentScenarioCatalog.find(
+    (scenario) => scenario.id === elements.exerciseScenarioSelect.value,
+  );
+  elements.exerciseScenarioHint.textContent =
+    selected?.description || "固定シナリオを選択してください。";
+  renderTechniqueList(
+    elements.exerciseTechniqueList,
+    selected?.techniques || [],
+    selected ? "TECHNIQUE MAPPING PENDING" : "SCENARIO NOT SELECTED",
+  );
+}
+
+function renderExerciseCatalog(catalog) {
+  const normalized = normalizeScenarioCatalog(catalog);
+  const catalogKey = JSON.stringify(normalized);
+  currentScenarioCatalog = normalized;
+  if (catalogKey !== renderedExerciseCatalogKey) {
+    renderedExerciseCatalogKey = catalogKey;
+    const previousScenarioId = elements.exerciseScenarioSelect.value;
+    elements.exerciseScenarioSelect.replaceChildren();
+    for (const scenario of normalized) {
+      const label = scenario.title === scenario.id
+        ? scenario.id
+        : `${scenario.id} · ${scenario.title}`;
+      elements.exerciseScenarioSelect.add(new Option(label, scenario.id));
+    }
+    elements.exerciseScenarioSelect.value = EXERCISE_SCENARIO_IDS.has(previousScenarioId)
+      ? previousScenarioId
+      : normalized[0]?.id || "";
+  }
+  updateExerciseScenarioSummary();
+}
+
+function eligibleExerciseNodes(nodes) {
+  return nodes.filter(
+    (node) => node.profile === "purple_lab" && node.session_active !== false,
+  );
+}
+
+function renderExerciseNodes(nodes) {
+  const exerciseNodes = eligibleExerciseNodes(nodes);
+  const nodeKey = JSON.stringify(
+    exerciseNodes.map((node) => ({
+      id: node.id,
+      name: node.name,
+      status: node.status,
+      session_active: node.session_active,
+    })),
+  );
+  if (nodeKey === renderedExerciseNodeKey) return;
+  renderedExerciseNodeKey = nodeKey;
+  const previousNodeId = elements.exerciseNodeSelect.value;
+  elements.exerciseNodeSelect.replaceChildren(new Option("purple_lab Node を選択", ""));
+  for (const node of exerciseNodes) {
+    const option = new Option(
+      `${node.name || node.id} · ${String(node.status || "unknown").toUpperCase()}`,
+      node.id,
+    );
+    option.disabled = node.status !== "online";
+    elements.exerciseNodeSelect.add(option);
+  }
+  const previousOption = Array.from(elements.exerciseNodeSelect.options).find(
+    (option) => option.value === previousNodeId && !option.disabled,
+  );
+  const firstOnline = Array.from(elements.exerciseNodeSelect.options).find(
+    (option) => option.value && !option.disabled,
+  );
+  elements.exerciseNodeSelect.value = previousOption?.value || firstOnline?.value || "";
+}
+
+function selectedExerciseNode() {
+  const nodes = Array.isArray(latestOverview?.nodes) ? latestOverview.nodes : [];
+  return nodes.find((node) => node.id === elements.exerciseNodeSelect.value) || null;
+}
+
+function createExerciseFact(label, value) {
+  const fact = document.createElement("span");
+  fact.append(
+    makeTextElement("small", "", label),
+    makeTextElement("strong", "", value || "—"),
+  );
+  return fact;
+}
+
+function exerciseAlertItem(alert) {
+  const item = document.createElement("li");
+  item.className = "exercise-alert";
+  const severity = recordText(alert, "severity", "level", "status").toLowerCase() || "info";
+  item.dataset.severity = severity;
+  const title = recordText(alert, "title", "signal_id", "id", "kind") || "DETECTION ALERT";
+  const message = recordText(alert, "message", "description", "outcome") || compactJson(alert);
+  item.append(
+    makeTextElement("strong", "", title),
+    makeTextElement("p", "", message),
+    makeTextElement("span", "", severity.toUpperCase()),
+  );
+  return item;
+}
+
+function exerciseTimelineItem(entry, index) {
+  const item = document.createElement("li");
+  item.className = "exercise-timeline__item";
+  const marker = makeTextElement("span", "exercise-timeline__marker", String(index + 1));
+  marker.setAttribute("aria-hidden", "true");
+  const body = document.createElement("div");
+  const title = recordText(entry, "title", "label", "kind", "phase") || `STEP ${index + 1}`;
+  const description =
+    recordText(entry, "message", "description", "outcome") || compactJson(entry);
+  const metadata = [];
+  const time = recordText(entry, "time", "timestamp", "created_at");
+  const offset = recordText(entry, "offset_ms");
+  const technique = recordText(entry, "technique_id");
+  if (time) metadata.push(localTime(time));
+  if (offset) metadata.push(`+${offset} ms`);
+  if (technique) metadata.push(technique);
+  body.append(
+    makeTextElement("strong", "", title),
+    makeTextElement("p", "", description),
+    makeTextElement("small", "", metadata.join(" · ") || "synthetic timeline"),
+  );
+  item.append(marker, body);
+  return item;
+}
+
+function isTerminalExercise(exercise) {
+  return TERMINAL_EXERCISE_STATUSES.has(String(exercise.status || "").toLowerCase());
+}
+
+function createExerciseCard(exercise, nodeNames, scenarioTitles) {
+  const card = document.createElement("article");
+  card.className = "exercise-card";
+  const status = String(exercise.status || "unknown").toLowerCase();
+  const detectionStatus = String(exercise.detection_status || "pending").toLowerCase();
+  card.dataset.status = status;
+  card.dataset.detection = detectionStatus;
+
+  const header = document.createElement("div");
+  header.className = "exercise-card__header";
+  const identity = document.createElement("div");
+  identity.append(
+    makeTextElement("span", "exercise-card__scenario", exercise.scenario_id || "UNKNOWN_SCENARIO"),
+    makeTextElement(
+      "h3",
+      "",
+      exercise.title || scenarioTitles.get(exercise.scenario_id) || exercise.scenario_id || "演習",
+    ),
+  );
+  const badges = document.createElement("div");
+  badges.className = "exercise-card__badges";
+  const statusBadge = makeTextElement("span", "exercise-state", status.toUpperCase());
+  statusBadge.dataset.status = status;
+  const detectionBadge = makeTextElement(
+    "span",
+    "exercise-detection",
+    `DETECTION ${detectionStatus.toUpperCase()}`,
+  );
+  detectionBadge.dataset.status = detectionStatus;
+  badges.append(statusBadge, detectionBadge);
+  header.append(identity, badges);
+
+  const taskIds = Array.isArray(exercise.task_ids)
+    ? exercise.task_ids.filter((taskId) => typeof taskId === "string").slice(0, 16)
+    : [];
+  const facts = document.createElement("div");
+  facts.className = "exercise-card__facts";
+  facts.append(
+    createExerciseFact("EXERCISE", exercise.id),
+    createExerciseFact("NODE", nodeNames.get(exercise.node_id) || exercise.node_id),
+    createExerciseFact("CREATED BY", exercise.created_by),
+    createExerciseFact("CREATED", localTime(exercise.created_at)),
+    createExerciseFact("COMPLETED", localTime(exercise.completed_at)),
+    createExerciseFact("TASK IDS", taskIds.join(" · ") || "—"),
+  );
+
+  const techniques = document.createElement("div");
+  techniques.className = "technique-list exercise-card__techniques";
+  techniques.setAttribute("aria-label", "ATT&CK technique mapping");
+  renderTechniqueList(techniques, exercise.techniques || [], "NO TECHNIQUE MAPPING");
+
+  const observations = document.createElement("div");
+  observations.className = "exercise-observations";
+  const alertsSection = document.createElement("section");
+  alertsSection.className = "exercise-observation";
+  alertsSection.append(makeTextElement("h4", "", "DETECTION ALERTS"));
+  const alertList = document.createElement("ul");
+  alertList.className = "exercise-alerts";
+  const alerts = Array.isArray(exercise.alerts) ? exercise.alerts : [];
+  if (alerts.length === 0) {
+    alertList.append(makeTextElement("li", "exercise-observation__empty", "検知alertはまだありません。"));
+  } else {
+    for (const alert of alerts.slice(0, 50)) alertList.append(exerciseAlertItem(alert));
+  }
+  alertsSection.append(alertList);
+
+  const timelineSection = document.createElement("section");
+  timelineSection.className = "exercise-observation";
+  timelineSection.append(makeTextElement("h4", "", "SCENARIO TIMELINE"));
+  const timelineList = document.createElement("ol");
+  timelineList.className = "exercise-timeline";
+  const timeline = Array.isArray(exercise.timeline) ? exercise.timeline : [];
+  if (timeline.length === 0) {
+    timelineList.append(makeTextElement("li", "exercise-observation__empty", "timelineを待機中です。"));
+  } else {
+    timeline.slice(0, 50).forEach((entry, index) => {
+      timelineList.append(exerciseTimelineItem(entry, index));
+    });
+  }
+  timelineSection.append(timelineList);
+  observations.append(alertsSection, timelineSection);
+
+  const containment = document.createElement("div");
+  containment.className = "exercise-containment";
+  containment.append(
+    makeTextElement("span", "", "CONTAINMENT STATE"),
+    makeTextElement(
+      "p",
+      "",
+      exercise.containment ? compactJson(exercise.containment) : "未適用",
+    ),
+  );
+
+  const actions = document.createElement("div");
+  actions.className = "exercise-card__actions";
+  actions.append(makeTextElement("span", "", "ADMIN CONTAINMENT"));
+  const actionDefinitions = [
+    ["CANCEL_REMAINING", "残りのタスクを取消"],
+    ["INVALIDATE_NODE_SESSION", "Node sessionを無効化"],
+  ];
+  for (const [action, label] of actionDefinitions) {
+    const button = makeTextElement("button", "button button--danger-ghost button--compact", label);
+    button.type = "button";
+    button.dataset.exerciseContain = "true";
+    button.dataset.exerciseId = typeof exercise.id === "string" ? exercise.id : "";
+    button.dataset.containmentAction = action;
+    button.dataset.exerciseTerminal = String(isTerminalExercise(exercise));
+    button.addEventListener("click", () => containExercise(exercise.id, action, button));
+    actions.append(button);
+  }
+
+  card.append(header, facts, techniques, observations, containment, actions);
+  return card;
+}
+
+function renderExercises(exercises, nodes, catalog) {
+  const nodeNames = new Map(nodes.map((node) => [node.id, node.name]));
+  const scenarioTitles = new Map(catalog.map((scenario) => [scenario.id, scenario.title]));
+  const renderKey = JSON.stringify({ exercises, nodes: Array.from(nodeNames), catalog });
+  if (renderKey === renderedExerciseKey) {
+    updateControls();
+    return;
+  }
+  renderedExerciseKey = renderKey;
+  elements.exerciseList.replaceChildren();
+  elements.exerciseCountBadge.textContent = `${exercises.length} EXERCISES`;
+  elements.exercisesEmpty.classList.toggle("is-visible", exercises.length === 0);
+  for (const exercise of exercises) {
+    if (!exercise || typeof exercise !== "object" || Array.isArray(exercise)) continue;
+    elements.exerciseList.append(createExerciseCard(exercise, nodeNames, scenarioTitles));
+  }
+  updateControls();
 }
 
 function setMetric(element, value) {
@@ -315,7 +828,9 @@ function createNodeCard(node) {
   meta.append(
     createMetaItem("VERSION", node.version),
     createMetaItem("CAPABILITY PROFILE", node.profile),
-    createMetaItem("POLL", Number.isFinite(node.poll_interval_ms) ? `${node.poll_interval_ms} ms` : "—"),
+    createMetaItem("POLL", Number.isFinite(node.poll_interval_ms)
+      ? `${node.poll_interval_ms} ms${node.jitter_percent ? ` ±${node.jitter_percent}%` : ""}`
+      : "—"),
     createMetaItem("LAST SEEN", localTime(node.last_seen), "last_seen"),
   );
 
@@ -493,6 +1008,7 @@ function renderTasks(tasks, nodes) {
       task.status,
       task.node_id,
       nodeNames.get(task.node_id),
+      task.created_by,
     ]
       .map(normalizedSearch)
       .join(" ");
@@ -524,7 +1040,11 @@ function renderTasks(tasks, nodes) {
     const status = makeTextElement("span", "status-badge", statusName.toUpperCase());
     status.dataset.status = statusName;
     statusCell.append(status);
-    row.append(statusCell, createTableCell("task-time", localTime(task.created_at)));
+    row.append(
+      statusCell,
+      createTableCell("task-actor", task.created_by || "—"),
+      createTableCell("task-time", localTime(task.created_at)),
+    );
 
     const detailCell = document.createElement("td");
     const detailButton = makeTextElement("button", "detail-button", "···");
@@ -543,6 +1063,13 @@ function eventTone(event) {
   if (event.level === "warning" || kind.endsWith("timeout") || kind.endsWith("stale")) return "warning";
   if (kind.endsWith("completed") || kind.endsWith("online") || kind.endsWith("enrolled")) return "success";
   return "info";
+}
+
+function eventDescription(event) {
+  if (event.kind === "operator.note" && typeof event.data?.message === "string") {
+    return event.data.message;
+  }
+  return compactJson(event.data);
 }
 
 function updateEventActorOptions(events) {
@@ -605,7 +1132,7 @@ function renderEvents(events, { auditView = false } = {}) {
       event.correlation_id,
       event.sequence,
       eventLevel,
-      compactJson(event.data),
+      eventDescription(event),
     ]
       .map(normalizedSearch)
       .join(" ");
@@ -643,7 +1170,7 @@ function renderEvents(events, { auditView = false } = {}) {
     content.className = "event-item__content";
     content.append(
       makeTextElement("strong", "", event.kind || "unknown.event"),
-      makeTextElement("p", "", compactJson(event.data)),
+      makeTextElement("p", "", eventDescription(event)),
     );
 
     const sourceParts = [];
@@ -667,22 +1194,30 @@ function renderHistory() {
   renderEvents(auditView ? records.map(auditEntryAsEvent) : records, { auditView });
 }
 
-function renderOverview(overview, audit) {
-  if (overview.lab_mode !== true) {
-    throw new ApiError("localhost lab_mode を確認できない応答を拒否しました。");
-  }
-
-  const nodes = Array.isArray(overview.nodes) ? overview.nodes : [];
-  const tasks = Array.isArray(overview.tasks) ? overview.tasks : [];
-  const events = Array.isArray(overview.events) ? overview.events : [];
-  const auditEntries = Array.isArray(audit) ? audit : [];
-  latestOverview = { ...overview, nodes, tasks, events, audit: auditEntries };
+function renderOverview(overview, eventHistory, auditHistory) {
+  const nodes = overview.nodes;
+  const tasks = overview.tasks;
+  const exercises = overview.exercises;
+  const events = [...eventHistory].reverse();
+  const auditEntries = [...auditHistory].reverse();
+  renderExerciseCatalog(overview.scenario_catalog);
+  latestOverview = {
+    ...overview,
+    nodes,
+    tasks,
+    exercises,
+    scenario_catalog: currentScenarioCatalog,
+    events,
+    audit: auditEntries,
+  };
 
   elements.labModeValue.textContent = "LOCALHOST LAB";
   elements.protocolValue.textContent = overview.protocol || "unknown";
   renderMetrics(overview.counts || {});
   renderNodes(nodes);
+  renderExerciseNodes(nodes);
   renderTasks(tasks, nodes);
+  renderExercises(exercises, nodes, currentScenarioCatalog);
   renderHistory();
   elements.lastUpdated.textContent = `最終更新 ${updateTimeFormatter.format(new Date())}`;
   setConnectedLayout(true);
@@ -690,18 +1225,42 @@ function renderOverview(overview, audit) {
 
 function clearOverview() {
   setConnectedLayout(false);
+  clearOperatorSession();
+  resetSyncState();
   latestOverview = null;
   elements.labModeValue.textContent = "LOCALHOST LAB";
   elements.protocolValue.textContent = "loopback-http-poll/v1";
   renderMetrics();
   renderNodes([]);
+  renderExerciseCatalog([]);
+  renderExerciseNodes([]);
   renderTasks([], []);
+  renderExercises([], [], currentScenarioCatalog);
   renderEvents([], { auditView: elements.activitySourceFilter.value === "audit" });
   elements.lastUpdated.textContent = "未取得";
+  updateControls();
 }
 
 function updateControls() {
   const hasToken = Boolean(operatorToken);
+  const canWriteTasks = hasPermission("task_write");
+  const canWriteNotes = hasPermission("note_write");
+  const canWriteExercises = hasPermission("exercise_write");
+  const canContainExercises =
+    currentRole === "admin" && hasPermission("containment_write");
+  const canReset = hasPermission("reset");
+  const noteBusy = elements.noteSubmitButton.dataset.busy === "true";
+  const noteLength = elements.noteInput.value.length;
+  const noteMessage = elements.noteInput.value.trim();
+  const exerciseBusy = elements.createExerciseButton.dataset.busy === "true";
+  const exerciseNode = selectedExerciseNode();
+  const exerciseScenarioAllowed = EXERCISE_SCENARIO_IDS.has(
+    elements.exerciseScenarioSelect.value,
+  );
+  const exerciseNodeAllowed =
+    exerciseNode?.profile === "purple_lab" &&
+    exerciseNode.session_active !== false &&
+    exerciseNode.status === "online";
   const node = selectedNode();
   const selectedType = elements.taskTypeSelect.value;
   const typeAllowed =
@@ -713,12 +1272,106 @@ function updateControls() {
     !hasToken || refreshInFlight || elements.refreshButton.dataset.busy === "true";
   elements.connectButton.disabled = elements.connectButton.dataset.busy === "true";
   elements.resetButton.disabled =
-    !hasToken || elements.resetButton.dataset.busy === "true";
+    !hasToken || !canReset || elements.resetButton.dataset.busy === "true";
   elements.createTaskButton.disabled =
     !hasToken ||
+    !canWriteTasks ||
     !node ||
     !typeAllowed ||
     elements.createTaskButton.dataset.busy === "true";
+  elements.noteInput.disabled = !hasToken || !canWriteNotes || noteBusy;
+  elements.noteSubmitButton.disabled =
+    !hasToken ||
+    !canWriteNotes ||
+    noteBusy ||
+    !noteMessage ||
+    noteLength > MAX_NOTE_LENGTH;
+  elements.createExerciseButton.disabled =
+    !hasToken ||
+    !canWriteExercises ||
+    !exerciseNodeAllowed ||
+    !exerciseScenarioAllowed ||
+    exerciseBusy;
+  elements.exerciseForm.dataset.permission = canWriteExercises ? "allowed" : "denied";
+  if (!hasToken) {
+    elements.exercisePermissionHint.textContent =
+      "接続後、exercise_write権限を持つOperatorだけが開始できます。";
+  } else if (!currentRole) {
+    elements.exercisePermissionHint.textContent = "Operatorの演習権限を確認中です。";
+  } else if (!canWriteExercises) {
+    elements.exercisePermissionHint.textContent =
+      `${currentRole.toUpperCase()} roleは演習を閲覧できますが、開始にはexercise_write権限が必要です。`;
+  } else if (!exerciseNodeAllowed) {
+    elements.exercisePermissionHint.textContent =
+      "ONLINEかつsession有効なpurple_lab Nodeを選択してください。";
+  } else {
+    elements.exercisePermissionHint.textContent =
+      "固定シナリオだけをNode-private synthetic workspaceで開始します。";
+  }
+  elements.noteCharacterCount.textContent = `${noteLength} / ${MAX_NOTE_LENGTH}`;
+  elements.noteCharacterCount.dataset.limit = noteLength > MAX_NOTE_LENGTH ? "exceeded" : "ok";
+  elements.noteForm.dataset.permission = canWriteNotes ? "allowed" : "denied";
+  if (!hasToken) {
+    elements.notePermissionHint.textContent = "接続後、note_write権限を持つOperatorだけが投稿できます。";
+  } else if (!currentRole) {
+    elements.notePermissionHint.textContent = "Operatorの権限情報を確認中です。";
+  } else if (!canWriteNotes) {
+    elements.notePermissionHint.textContent = `${currentRole.toUpperCase()} roleはメモを閲覧できますが、投稿にはnote_write権限が必要です。`;
+  } else {
+    elements.notePermissionHint.textContent = "最大240文字のplain textとして共有履歴へ記録します。";
+  }
+  elements.noteInput.setAttribute("aria-disabled", String(elements.noteInput.disabled));
+  elements.noteSubmitButton.setAttribute(
+    "aria-disabled",
+    String(elements.noteSubmitButton.disabled),
+  );
+  elements.createExerciseButton.setAttribute(
+    "aria-disabled",
+    String(elements.createExerciseButton.disabled),
+  );
+  elements.createExerciseButton.title =
+    currentRole && !canWriteExercises ? "exercise_write 権限が必要です。" : "";
+  elements.resetButton.setAttribute("aria-disabled", String(elements.resetButton.disabled));
+  elements.createTaskButton.setAttribute("aria-disabled", String(elements.createTaskButton.disabled));
+  elements.resetButton.title = currentRole && !canReset ? "reset 権限が必要です。" : "";
+  elements.createTaskButton.title =
+    currentRole && !canWriteTasks ? "task_write 権限が必要です。" : "";
+  elements.resetButton.setAttribute(
+    "aria-label",
+    currentRole && !canReset ? "リセット（reset 権限が必要）" : "リセット",
+  );
+  elements.createTaskButton.setAttribute(
+    "aria-label",
+    currentRole && !canWriteTasks
+      ? "許可タスクをキューへ送信（task_write 権限が必要）"
+      : "許可タスクをキューへ送信",
+  );
+  for (const cancelButton of elements.taskDetailBody.querySelectorAll("[data-task-cancel]")) {
+    cancelButton.disabled = !hasToken || !canWriteTasks || cancelButton.dataset.busy === "true";
+    cancelButton.setAttribute("aria-disabled", String(cancelButton.disabled));
+    cancelButton.title = canWriteTasks ? "" : "task_write 権限が必要です。";
+    cancelButton.setAttribute(
+      "aria-label",
+      canWriteTasks ? "待機タスクを取り消す" : "待機タスクを取り消す（task_write 権限が必要）",
+    );
+  }
+  for (const containButton of elements.exerciseList.querySelectorAll("[data-exercise-contain]")) {
+    const actionAllowed = CONTAINMENT_ACTIONS.has(containButton.dataset.containmentAction);
+    const terminal = containButton.dataset.exerciseTerminal === "true";
+    containButton.disabled =
+      !hasToken ||
+      !canContainExercises ||
+      !actionAllowed ||
+      !containButton.dataset.exerciseId ||
+      terminal ||
+      containButton.dataset.busy === "true";
+    containButton.setAttribute("aria-disabled", String(containButton.disabled));
+    containButton.title = !canContainExercises
+      ? "admin roleとcontainment_write権限が必要です。"
+      : terminal
+        ? "終了済みの演習です。"
+        : "";
+  }
 }
 
 async function refresh({ silent = false } = {}) {
@@ -728,26 +1381,96 @@ async function refresh({ silent = false } = {}) {
   refreshInFlight = true;
   elements.metricGrid.setAttribute("aria-busy", "true");
   elements.nodeList.setAttribute("aria-busy", "true");
+  elements.exerciseList.setAttribute("aria-busy", "true");
   elements.eventList.setAttribute("aria-busy", "true");
   if (!silent || !latestOverview) setApiState("loading", "更新中");
   updateControls();
 
   try {
-    const [overview, audit] = await Promise.all([api("/lab/overview"), api("/lab/audit")]);
-    if (requestGeneration !== tokenGeneration || requestToken !== operatorToken) return;
-    renderOverview(overview, audit);
+    let nextCursors = { ...syncCursors };
+    let nextHistory = {
+      events: [...retainedHistory.events],
+      audit: [...retainedHistory.audit],
+    };
+    let nextStreamId = syncStreamId;
+    let overview = null;
+    const needsSession = sessionGeneration !== requestGeneration;
+    const sessionRequest = needsSession ? api("/lab/session") : Promise.resolve(null);
+
+    for (let pageIndex = 0; pageIndex < MAX_SYNC_PAGES; pageIndex += 1) {
+      let page;
+      let session = null;
+      if (pageIndex === 0) {
+        [page, session] = await Promise.all([api(syncPath(nextCursors)), sessionRequest]);
+      } else {
+        page = await api(syncPath(nextCursors));
+      }
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      validateSyncPage(page);
+      if (nextStreamId && page.stream_id !== nextStreamId) {
+        nextStreamId = page.stream_id;
+        nextCursors = { events: 0, audit: 0 };
+        nextHistory = { events: [], audit: [] };
+        overview = null;
+        sessionGeneration = -1;
+        clearOperatorSession();
+        continue;
+      }
+      nextStreamId = page.stream_id;
+      if (session) {
+        renderOperatorSession(session);
+        sessionGeneration = requestGeneration;
+      }
+
+      const previousCursors = nextCursors;
+      nextHistory = {
+        events: mergeHistoryRecords(
+          nextHistory.events,
+          page.events,
+          page.cursor_reset.events,
+        ),
+        audit: mergeHistoryRecords(
+          nextHistory.audit,
+          page.audit,
+          page.cursor_reset.audit,
+        ),
+      };
+      nextCursors = {
+        events: syncCounter(page.cursors, "events", "cursors"),
+        audit: syncCounter(page.cursors, "audit", "cursors"),
+      };
+      if (
+        (page.has_more.events && nextCursors.events === previousCursors.events) ||
+        (page.has_more.audit && nextCursors.audit === previousCursors.audit)
+      ) {
+        throw new ApiError("同期カーソルが進まない応答を拒否しました。");
+      }
+      overview = page;
+      if (!page.has_more.events && !page.has_more.audit) break;
+    }
+
+    if (!overview || requestIsStale(requestGeneration, requestToken)) return;
+    syncStreamId = nextStreamId;
+    syncCursors = nextCursors;
+    retainedHistory = nextHistory;
+    renderOverview(overview, retainedHistory.events, retainedHistory.audit);
     setApiState("online", "localhost 接続中");
   } catch (error) {
-    if (requestGeneration !== tokenGeneration || requestToken !== operatorToken) return;
+    if (requestIsStale(requestGeneration, requestToken)) return;
     if (error?.status === 401) clearOverview();
     setApiState("error", error?.status === 401 ? "認証エラー" : "接続エラー");
     if (!silent) showToast(humanError(error), "error");
   } finally {
+    const tokenChangedDuringRequest = requestIsStale(requestGeneration, requestToken);
     refreshInFlight = false;
     elements.metricGrid.setAttribute("aria-busy", "false");
     elements.nodeList.setAttribute("aria-busy", "false");
+    elements.exerciseList.setAttribute("aria-busy", "false");
     elements.eventList.setAttribute("aria-busy", "false");
     updateControls();
+    if (tokenChangedDuringRequest && operatorToken) {
+      window.queueMicrotask(() => refresh());
+    }
   }
 }
 
@@ -827,6 +1550,7 @@ function showTaskDetail(task, nodeName) {
   addDetailValue(grid, "Status", String(task.status || "unknown").toUpperCase());
   addDetailValue(grid, "Delivery attempts", task.delivery_attempts);
   addDetailValue(grid, "Node", nodeName || task.node_id);
+  addDetailValue(grid, "Created by", task.created_by);
   addDetailValue(grid, "Created", localTime(task.created_at));
   addDetailValue(grid, "Dispatched", localTime(task.dispatched_at));
   addDetailValue(grid, "Completed", localTime(task.completed_at));
@@ -847,8 +1571,14 @@ function showTaskDetail(task, nodeName) {
       "待機タスクを取り消す",
     );
     cancelButton.type = "button";
+    cancelButton.dataset.taskCancel = "true";
     cancelButton.addEventListener("click", async () => {
-      cancelButton.disabled = true;
+      if (!hasPermission("task_write")) {
+        showToast("待機タスクの取消には task_write 権限が必要です。", "error");
+        return;
+      }
+      cancelButton.dataset.busy = "true";
+      updateControls();
       try {
         await api(`/lab/tasks/${task.id}/cancel`, { method: "POST", body: {} });
         elements.taskDetailDialog.close();
@@ -857,11 +1587,13 @@ function showTaskDetail(task, nodeName) {
       } catch (error) {
         showToast(humanError(error), "error");
       } finally {
-        cancelButton.disabled = false;
+        delete cancelButton.dataset.busy;
+        updateControls();
       }
     });
     actions.append(cancelButton);
     elements.taskDetailBody.append(actions);
+    updateControls();
   }
   if (elements.taskDetailDialog.open) elements.taskDetailDialog.close();
   elements.taskDetailDialog.showModal();
@@ -927,6 +1659,16 @@ function readPayload() {
     if (typeof payload.message !== "string" || payload.message.trim().length < 1 || payload.message.trim().length > 240) {
       throw new Error("message は1〜240文字にしてください。");
     }
+  } else if (type === "SLEEP") {
+    exactPayloadKeys(payload, ["interval_ms", "jitter_percent"]);
+    if (!Number.isInteger(payload.interval_ms) || payload.interval_ms < 250 || payload.interval_ms > 3000) {
+      throw new Error("interval_ms は250〜3000の整数にしてください。");
+    }
+    if (!Number.isInteger(payload.jitter_percent) || payload.jitter_percent < 0 || payload.jitter_percent > 50) {
+      throw new Error("jitter_percent は0〜50の整数にしてください。");
+    }
+  } else if (type === "EXIT") {
+    exactPayloadKeys(payload, []);
   } else if (type === "RUN_PLAYBOOK") {
     exactPayloadKeys(payload, ["playbook"]);
     if (!["DISCOVERY_FIXTURES", "COLLECT_AND_STAGE", "CREATE_CANARY", "CLEANUP"].includes(payload.playbook)) {
@@ -955,9 +1697,15 @@ function storedToken() {
 
 function saveToken(token) {
   const nextToken = token.trim();
-  if (nextToken !== operatorToken) {
+  const changed = nextToken !== operatorToken;
+  if (changed) {
     tokenGeneration += 1;
     pendingTaskSubmission = null;
+    pendingNoteSubmission = null;
+    pendingExerciseSubmission = null;
+    elements.noteInput.value = "";
+    resetSyncState();
+    clearOperatorSession();
   }
   operatorToken = nextToken;
   try {
@@ -969,6 +1717,7 @@ function saveToken(token) {
   elements.tokenInput.value = operatorToken;
   if (!operatorToken) setTokenVisibility(false);
   updateControls();
+  return changed;
 }
 
 function newIdempotencyKey() {
@@ -992,6 +1741,7 @@ async function runWithBusyButton(button, label, action) {
   button.dataset.busy = "true";
   button.replaceChildren(document.createTextNode(label));
   button.disabled = true;
+  updateControls();
   try {
     return await action();
   } finally {
@@ -1001,9 +1751,47 @@ async function runWithBusyButton(button, label, action) {
   }
 }
 
+async function containExercise(exerciseId, action, button) {
+  if (currentRole !== "admin" || !hasPermission("containment_write")) {
+    showToast("封じ込めにはadmin roleとcontainment_write権限が必要です。", "error");
+    return;
+  }
+  if (typeof exerciseId !== "string" || !CONTAINMENT_ACTIONS.has(action)) {
+    showToast("固定封じ込めactionを確認できません。", "error");
+    return;
+  }
+  const exercise = latestOverview?.exercises?.find((candidate) => candidate.id === exerciseId);
+  if (!exercise || isTerminalExercise(exercise)) {
+    showToast("この演習は終了済みか、現在の同期snapshotにありません。", "error");
+    return;
+  }
+  const confirmation = action === "INVALIDATE_NODE_SESSION"
+    ? "この演習のNode sessionを無効化しますか？同じsessionでは以後pollできません。"
+    : "この演習で未完了の固定タスクを取り消しますか？";
+  if (!window.confirm(confirmation)) return;
+
+  const requestGeneration = tokenGeneration;
+  const requestToken = operatorToken;
+  await runWithBusyButton(button, "適用中…", async () => {
+    try {
+      await api(`/lab/exercises/${encodeURIComponent(exerciseId)}/contain`, {
+        method: "POST",
+        body: { action },
+      });
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      showToast(`封じ込め ${action} を適用しました。`, "success");
+      await refresh({ silent: true });
+    } catch (error) {
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      showToast(humanError(error), "error");
+    }
+  });
+}
+
 elements.tokenForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  saveToken(elements.tokenInput.value);
+  const tokenChanged = saveToken(elements.tokenInput.value);
+  if (tokenChanged) clearOverview();
   if (!operatorToken) {
     setApiState("error", "token が必要です");
     showToast("Operator token を入力してください。", "error");
@@ -1031,6 +1819,105 @@ elements.taskTypeSelect.addEventListener("change", () => {
 });
 elements.restoreTemplateButton.addEventListener("click", applyTaskTemplate);
 
+elements.exerciseNodeSelect.addEventListener("change", updateControls);
+elements.exerciseScenarioSelect.addEventListener("change", () => {
+  updateExerciseScenarioSummary();
+  updateControls();
+});
+elements.exerciseForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!hasPermission("exercise_write")) {
+    showToast("演習の開始には exercise_write 権限が必要です。", "error");
+    return;
+  }
+  const node = selectedExerciseNode();
+  if (
+    !node ||
+    node.profile !== "purple_lab" ||
+    node.session_active === false ||
+    node.status !== "online"
+  ) {
+    showToast("ONLINEかつsession有効なpurple_lab Nodeを選択してください。", "error");
+    return;
+  }
+  const scenarioId = elements.exerciseScenarioSelect.value;
+  if (!EXERCISE_SCENARIO_IDS.has(scenarioId)) {
+    showToast("固定scenario catalogから選択してください。", "error");
+    return;
+  }
+
+  const requestGeneration = tokenGeneration;
+  const requestToken = operatorToken;
+  await runWithBusyButton(elements.createExerciseButton, "開始中…", async () => {
+    const requestBody = { node_id: node.id, scenario_id: scenarioId };
+    const signature = JSON.stringify(requestBody);
+    if (!pendingExerciseSubmission || pendingExerciseSubmission.signature !== signature) {
+      pendingExerciseSubmission = { signature, key: newIdempotencyKey() };
+    }
+    try {
+      const exercise = await api("/lab/exercises", {
+        method: "POST",
+        body: requestBody,
+        idempotencyKey: pendingExerciseSubmission.key,
+      });
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      pendingExerciseSubmission = null;
+      showToast(`演習 ${exercise.id || scenarioId} を開始しました。`, "success");
+      await refresh({ silent: true });
+    } catch (error) {
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        pendingExerciseSubmission = null;
+      }
+      showToast(humanError(error), "error");
+    }
+  });
+});
+
+elements.noteInput.addEventListener("input", updateControls);
+elements.noteForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!hasPermission("note_write")) {
+    showToast("メモの共有には note_write 権限が必要です。", "error");
+    return;
+  }
+  const message = elements.noteInput.value.trim();
+  if (!message || message.length > MAX_NOTE_LENGTH) {
+    showToast("メモは1〜240文字のplain textにしてください。", "error");
+    elements.noteInput.focus();
+    return;
+  }
+
+  const requestGeneration = tokenGeneration;
+  const requestToken = operatorToken;
+  await runWithBusyButton(elements.noteSubmitButton, "共有中…", async () => {
+    const requestBody = { message };
+    const signature = JSON.stringify(requestBody);
+    if (!pendingNoteSubmission || pendingNoteSubmission.signature !== signature) {
+      pendingNoteSubmission = { signature, key: newIdempotencyKey() };
+    }
+    try {
+      await api("/lab/notes", {
+        method: "POST",
+        body: { message },
+        idempotencyKey: pendingNoteSubmission.key,
+      });
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      pendingNoteSubmission = null;
+      elements.noteInput.value = "";
+      updateControls();
+      showToast("共同作業メモを共有しました。", "success");
+      await refresh({ silent: true });
+    } catch (error) {
+      if (requestIsStale(requestGeneration, requestToken)) return;
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        pendingNoteSubmission = null;
+      }
+      showToast(humanError(error), "error");
+    }
+  });
+});
+
 elements.taskPayloadInput.addEventListener("input", () => {
   try {
     readPayload();
@@ -1044,6 +1931,10 @@ elements.taskPayloadInput.addEventListener("input", () => {
 
 elements.taskForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!hasPermission("task_write")) {
+    showToast("タスク作成には task_write 権限が必要です。", "error");
+    return;
+  }
   const node = selectedNode();
   if (!node) {
     showToast("送信先 Node を選択してください。", "error");
@@ -1130,6 +2021,10 @@ elements.metricGrid.addEventListener("click", (event) => {
 });
 
 elements.resetButton.addEventListener("click", async () => {
+  if (!hasPermission("reset")) {
+    showToast("ラボのリセットには reset 権限が必要です。", "error");
+    return;
+  }
   const confirmed = window.confirm(
     "登録Node、タスク、イベントを消去し、現在のNodeセッションを無効化しますか？",
   );

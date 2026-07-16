@@ -56,6 +56,7 @@
         <a href="#overview">概要</a>
         <a href="#nodes">Node</a>
         <a href="#dispatch">送信</a>
+        <a href="#exercises">ATT&amp;CK演習</a>
         <a href="#tasks">結果</a>
         <a href="#events">履歴</a>
       </div>
@@ -73,6 +74,12 @@
           <div class="mode-strip" aria-label="ラボ情報">
             <span><small>MODE</small><strong id="labModeValue">LOCALHOST LAB</strong></span>
             <span><small>PROTOCOL</small><strong id="protocolValue">loopback-http-poll/v1</strong></span>
+            <span class="session-fact" data-state="unknown" aria-live="polite">
+              <small>PRINCIPAL</small><strong id="operatorPrincipalId">—</strong>
+            </span>
+            <span class="session-fact" data-state="unknown" aria-live="polite">
+              <small>ROLE</small><strong id="operatorRole">—</strong>
+            </span>
           </div>
         </div>
 
@@ -252,6 +259,8 @@
                 <option value="HASH_TEXT">HASH_TEXT</option>
                 <option value="WAIT">WAIT</option>
                 <option value="GENERATE_EVENT">GENERATE_EVENT</option>
+                <option value="SLEEP">SLEEP</option>
+                <option value="EXIT">EXIT</option>
                 <option value="RUN_PLAYBOOK">RUN_PLAYBOOK</option>
               </select>
             </label>
@@ -289,17 +298,79 @@
         </article>
       </section>
 
+      <section class="panel panel--exercises section-anchor" id="exercises" aria-labelledby="exercises-title">
+        <div class="panel__header panel__header--responsive">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">06</span> ATT&amp;CK EXERCISE CONTROL</p>
+            <h2 id="exercises-title">検知つき固定演習</h2>
+          </div>
+          <div class="exercise-header-meta">
+            <span class="count-badge" id="exerciseCountBadge">0 EXERCISES</span>
+            <span class="attack-tag">EDUCATIONAL MAPPING · PURPLE_LAB ONLY</span>
+          </div>
+        </div>
+
+        <div class="exercise-workspace">
+          <form class="exercise-launch" id="exerciseForm" aria-labelledby="exercise-launch-title">
+            <div class="exercise-launch__heading">
+              <div>
+                <span>FIXED SCENARIO</span>
+                <h3 id="exercise-launch-title">ATT&amp;CK演習を開始</h3>
+              </div>
+              <span class="permission-tag">EXERCISE_WRITE</span>
+            </div>
+            <label class="field" for="exerciseNodeSelect">
+              <span class="field__label">Purple Lab Node</span>
+              <select id="exerciseNodeSelect" name="node_id" required>
+                <option value="">purple_lab Node を選択</option>
+              </select>
+            </label>
+            <label class="field" for="exerciseScenarioSelect">
+              <span class="field__label">Scenario catalog</span>
+              <select id="exerciseScenarioSelect" name="scenario_id" required>
+                <option value="DISCOVERY_COLLECTION">DISCOVERY_COLLECTION</option>
+                <option value="CANARY_REMOVAL">CANARY_REMOVAL</option>
+              </select>
+            </label>
+            <div class="exercise-scenario-summary">
+              <p id="exerciseScenarioHint">同期カタログ取得後にシナリオ説明を表示します。</p>
+              <div class="technique-list" id="exerciseTechniqueList" aria-label="ATT&amp;CK techniques">
+                <span>CATALOG PENDING</span>
+              </div>
+            </div>
+            <p class="exercise-permission-hint" id="exercisePermissionHint">
+              接続後、exercise_write権限を持つOperatorだけが開始できます。
+            </p>
+            <button class="button button--primary button--full" id="createExerciseButton" type="submit" disabled>
+              固定演習を開始 <span aria-hidden="true">→</span>
+            </button>
+            <p class="exercise-safety-note">
+              SYNTHETIC FIXTURES ONLY · NO HOST DISCOVERY · NO REMOTE ACTION
+            </p>
+          </form>
+
+          <div class="exercise-feed">
+            <div class="exercise-list" id="exerciseList" aria-live="polite" aria-busy="false"></div>
+            <div class="empty-state empty-state--wide" id="exercisesEmpty">
+              <span class="empty-state__mark" aria-hidden="true">◎</span>
+              <strong>演習履歴はまだありません</strong>
+              <p>purple_lab Nodeと固定シナリオを選び、検知timelineを観察してください。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel panel--tasks section-anchor" id="tasks" aria-labelledby="tasks-title">
         <div class="panel__header panel__header--responsive">
           <div>
-            <p class="eyebrow"><span aria-hidden="true">06</span> CORRELATED TASKS</p>
+            <p class="eyebrow"><span aria-hidden="true">07</span> CORRELATED TASKS</p>
             <h2 id="tasks-title">タスクと結果</h2>
           </div>
           <div class="panel-tools">
             <span class="count-badge" id="taskCountBadge">0 TASKS</span>
             <label class="search-control" for="taskSearchInput">
               <span class="visually-hidden">タスクを検索</span>
-              <input id="taskSearchInput" type="search" placeholder="ID / correlation / type / Node" autocomplete="off" />
+              <input id="taskSearchInput" type="search" placeholder="ID / correlation / type / Node / Operator" autocomplete="off" />
             </label>
             <label class="filter-control" for="taskStatusFilter">
               <span>状態</span>
@@ -326,6 +397,7 @@
                 <th scope="col">TYPE</th>
                 <th scope="col">NODE</th>
                 <th scope="col">STATUS</th>
+                <th scope="col">CREATED BY</th>
                 <th scope="col">CREATED</th>
                 <th scope="col"><span class="visually-hidden">詳細</span></th>
               </tr>
@@ -343,7 +415,7 @@
       <section class="panel panel--events section-anchor" id="events" aria-labelledby="events-title">
         <div class="panel__header panel__header--responsive">
           <div>
-            <p class="eyebrow"><span aria-hidden="true">07</span> CONTROL-PLANE HISTORY</p>
+            <p class="eyebrow"><span aria-hidden="true">08</span> CONTROL-PLANE HISTORY</p>
             <h2 id="events-title">イベントと監査</h2>
           </div>
           <div class="panel-tools">
@@ -377,6 +449,36 @@
             <div class="live-label"><span aria-hidden="true"></span> 3秒ごとに自動更新</div>
           </div>
         </div>
+        <form class="operator-note" id="noteForm" aria-labelledby="noteComposerTitle">
+          <div class="operator-note__heading">
+            <div>
+              <span class="operator-note__eyebrow">SHARED OPERATOR NOTE</span>
+              <h3 id="noteComposerTitle">共同作業メモを共有</h3>
+            </div>
+            <span class="permission-tag">NOTE_WRITE</span>
+          </div>
+          <label class="field" for="noteInput">
+            <span class="field__label">Plain-text message</span>
+            <textarea
+              id="noteInput"
+              name="message"
+              rows="3"
+              maxlength="240"
+              required
+              disabled
+              autocomplete="off"
+              aria-describedby="notePermissionHint noteCharacterCount"
+              placeholder="他のOperatorへ共有する短いメモ"
+            ></textarea>
+          </label>
+          <div class="operator-note__footer">
+            <p id="notePermissionHint">接続後、note_write権限を持つOperatorだけが投稿できます。</p>
+            <span id="noteCharacterCount" aria-live="polite">0 / 240</span>
+            <button class="button button--primary" id="noteSubmitButton" type="submit" disabled>
+              メモを共有
+            </button>
+          </div>
+        </form>
         <div class="event-list" id="eventList" aria-busy="false"></div>
         <div class="empty-state empty-state--wide" id="eventsEmpty">
           <span class="empty-state__mark" aria-hidden="true">·</span>
