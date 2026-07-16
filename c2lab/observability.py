@@ -23,6 +23,8 @@ _EXACT_ROUTES = frozenset(
         "/lab/overview",
         "/lab/nodes",
         "/lab/tasks",
+        "/lab/scenarios",
+        "/lab/exercises",
         "/lab/notes",
         "/lab/events",
         "/lab/audit",
@@ -51,6 +53,8 @@ def normalized_route(path: Any) -> str:
         return "/lab/tasks/:task_id/cancel"
     if len(parts) == 4 and parts[:2] == ["lab", "operators"] and parts[3] == "revoke":
         return "/lab/operators/:session_id/revoke"
+    if len(parts) == 4 and parts[:2] == ["lab", "exercises"] and parts[3] == "contain":
+        return "/lab/exercises/:exercise_id/contain"
     return "unmatched"
 
 

@@ -338,6 +338,8 @@ class LabRequestHandler(BaseHTTPRequestHandler):
             "/lab/overview": self.server.lab_state.overview,
             "/lab/nodes": self.server.lab_state.nodes,
             "/lab/tasks": self.server.lab_state.tasks,
+            "/lab/scenarios": self.server.lab_state.scenarios,
+            "/lab/exercises": self.server.lab_state.exercises,
             "/lab/events": self.server.lab_state.events,
             "/lab/audit": self.server.lab_state.audit,
             "/lab/report": self.server.lab_state.report,
@@ -428,8 +430,17 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 and parts[:2] == ["lab", "operators"]
                 and parts[3] == "revoke"
             )
+            is_contain = (
+                len(parts) == 4
+                and parts[:2] == ["lab", "exercises"]
+                and parts[3] == "contain"
+            )
             if path == "/lab/tasks" or is_cancel:
                 permission = "task_write"
+            elif path == "/lab/exercises":
+                permission = "exercise_write"
+            elif is_contain:
+                permission = "containment_write"
             elif path == "/lab/notes":
                 permission = "note_write"
             elif path == "/lab/reset":
@@ -442,8 +453,9 @@ class LabRequestHandler(BaseHTTPRequestHandler):
             if session is None:
                 return
             if (
-                path not in {"/lab/tasks", "/lab/notes", "/lab/reset"}
+                path not in {"/lab/tasks", "/lab/exercises", "/lab/notes", "/lab/reset"}
                 and not is_cancel
+                and not is_contain
                 and not is_revoke
             ):
                 self._send_error(HTTPStatus.NOT_FOUND, "not_found", "route not found")
@@ -479,6 +491,16 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(HTTPStatus.CREATED, note)
                 return
+            if path == "/lab/exercises":
+                self._require_body_keys(body, required={"node_id", "scenario_id"})
+                exercise = self.server.lab_state.start_exercise(
+                    body["node_id"],
+                    body["scenario_id"],
+                    actor=session["principal_id"],
+                    idempotency_key=self._read_idempotency_key(),
+                )
+                self._send_json(HTTPStatus.CREATED, exercise)
+                return
             if is_cancel:
                 self._require_body_keys(body, required=set())
                 task = self.server.lab_state.cancel_task(
@@ -491,6 +513,15 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 self._require_body_keys(body, required=set())
                 self.server.lab_state.reset(actor=session["principal_id"])
                 self._send_json(HTTPStatus.OK, {"reset": True, "sessions_invalidated": True})
+                return
+            if is_contain:
+                self._require_body_keys(body, required={"action"})
+                exercise = self.server.lab_state.contain_exercise(
+                    parts[2],
+                    body["action"],
+                    actor=session["principal_id"],
+                )
+                self._send_json(HTTPStatus.OK, exercise)
                 return
             if is_revoke:
                 self._require_body_keys(body, required=set())

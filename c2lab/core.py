@@ -310,6 +310,9 @@ class LabState:
                 "last_seen": timestamp,
                 "tasks_completed": 0,
                 "tasks_failed": 0,
+                "tasking_paused": False,
+                "tasking_paused_at": None,
+                "tasking_paused_by": None,
                 "_session_token": session_token,
                 "_last_seen_monotonic": instant,
                 "_last_heartbeat_event": instant,
@@ -381,6 +384,13 @@ class LabState:
             if instant - node["_last_heartbeat_event"] >= HEARTBEAT_EVENT_SECONDS:
                 node["_last_heartbeat_event"] = instant
                 self._record_locked("node.heartbeat", node_id=node_id, actor="node")
+
+            if node.get("tasking_paused"):
+                return {
+                    "node": self._public_node(node),
+                    "task": None,
+                    "server_time": utc_now(),
+                }
 
             active = next(
                 (
@@ -718,6 +728,12 @@ class LabState:
                     code="node_disconnected",
                     status=409,
                 )
+            if node.get("tasking_paused"):
+                raise LabError(
+                    "node tasking is paused by containment",
+                    code="node_tasking_paused",
+                    status=409,
+                )
             if clean_type not in node["capabilities"]:
                 raise LabError(
                     "task is not allowed by the node profile",
@@ -958,13 +974,532 @@ class LabState:
                 )
         self._refresh_exercises_locked()
 
+    @staticmethod
+    def _public_exercise(exercise: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(
+            {key: value for key, value in exercise.items() if not key.startswith("_")}
+        )
+
+    def _append_exercise_timeline_locked(
+        self,
+        exercise: dict[str, Any],
+        *,
+        phase: str,
+        kind: str,
+        summary: str,
+        task_id: str | None = None,
+        rule_id: str | None = None,
+        technique_id: str | None = None,
+        action: str | None = None,
+    ) -> None:
+        """Append one fixed-schema timeline item within the catalog bound."""
+
+        if len(exercise["timeline"]) >= MAX_EXERCISE_TIMELINE:
+            return
+        exercise["_timeline_sequence"] += 1
+        exercise["timeline"].append(
+            {
+                "sequence": exercise["_timeline_sequence"],
+                "time": utc_now(),
+                "phase": phase,
+                "kind": kind,
+                "summary": summary,
+                "task_id": task_id,
+                "rule_id": rule_id,
+                "technique_id": technique_id,
+                "action": action,
+            }
+        )
+
+    def _refresh_exercises_locked(self) -> None:
+        """Derive fixed alerts and terminal state from validated task records."""
+
+        for exercise in self._exercises.values():
+            if exercise["status"] == "contained":
+                continue
+            for task_id in exercise["task_ids"]:
+                if task_id in exercise["_observed_task_ids"]:
+                    continue
+                task = self._tasks.get(task_id)
+                if task is None or task["status"] not in TERMINAL_TASK_STATUSES:
+                    continue
+                exercise["_observed_task_ids"].append(task_id)
+                playbook = task["payload"]["playbook"]
+                self._append_exercise_timeline_locked(
+                    exercise,
+                    phase="simulate",
+                    kind=f"task.{task['status']}",
+                    summary=f"{playbook} {task['status']}",
+                    task_id=task_id,
+                )
+                if task["status"] != "completed":
+                    continue
+                for rule in detections_for_playbook(exercise["scenario_id"], playbook):
+                    if any(alert["rule_id"] == rule["id"] for alert in exercise["alerts"]):
+                        continue
+                    detected_at = utc_now()
+                    alert = {
+                        "id": f"alert-{uuid.uuid4().hex[:12]}",
+                        "rule_id": rule["id"],
+                        "source_id": rule["source_id"],
+                        "name": rule["name"],
+                        "technique_id": rule["technique_id"],
+                        "severity": rule["severity"],
+                        "signal": rule["signal"],
+                        "status": "open",
+                        "detected_at": detected_at,
+                        "contained_at": None,
+                        "task_id": task_id,
+                    }
+                    exercise["alerts"].append(alert)
+                    exercise["detection_status"] = "detected"
+                    self._append_exercise_timeline_locked(
+                        exercise,
+                        phase="detect",
+                        kind="detection.matched",
+                        summary=rule["name"],
+                        task_id=task_id,
+                        rule_id=rule["id"],
+                        technique_id=rule["technique_id"],
+                    )
+                    self._record_locked(
+                        "exercise.detected",
+                        level="warning",
+                        node_id=exercise["node_id"],
+                        task_id=task_id,
+                        correlation_id=exercise["id"],
+                        data={
+                            "exercise_id": exercise["id"],
+                            "scenario_id": exercise["scenario_id"],
+                            "rule_id": rule["id"],
+                            "source_id": rule["source_id"],
+                            "technique_id": rule["technique_id"],
+                            "severity": rule["severity"],
+                            "signal": rule["signal"],
+                        },
+                    )
+                    self._audit_locked(
+                        "exercise.detected",
+                        actor="teamserver",
+                        node_id=exercise["node_id"],
+                        task_id=task_id,
+                        correlation_id=exercise["id"],
+                        task_type="RUN_PLAYBOOK",
+                        outcome="detected",
+                        reason=rule["id"],
+                    )
+
+            tasks = [self._tasks.get(task_id) for task_id in exercise["task_ids"]]
+            if not tasks or any(
+                task is None or task["status"] not in TERMINAL_TASK_STATUSES
+                for task in tasks
+            ):
+                continue
+            if exercise["_completion_recorded"]:
+                continue
+            exercise["_completion_recorded"] = True
+            exercise["status"] = (
+                "completed" if all(task["status"] == "completed" for task in tasks) else "failed"
+            )
+            exercise["completed_at"] = utc_now()
+            self._append_exercise_timeline_locked(
+                exercise,
+                phase="complete",
+                kind=f"exercise.{exercise['status']}",
+                summary=f"Exercise {exercise['status']}",
+            )
+            self._record_locked(
+                f"exercise.{exercise['status']}",
+                level="info" if exercise["status"] == "completed" else "warning",
+                node_id=exercise["node_id"],
+                correlation_id=exercise["id"],
+                data={
+                    "exercise_id": exercise["id"],
+                    "scenario_id": exercise["scenario_id"],
+                    "alerts": len(exercise["alerts"]),
+                },
+            )
+            self._audit_locked(
+                f"exercise.{exercise['status']}",
+                actor="teamserver",
+                node_id=exercise["node_id"],
+                correlation_id=exercise["id"],
+                outcome=exercise["status"],
+                reason="scenario_tasks_terminal",
+            )
+
+    def start_exercise(
+        self,
+        node_id: Any,
+        scenario_id: Any,
+        *,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
+        idempotency_key: Any = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Queue one fixed scenario against a purple-lab foreground node."""
+
+        if type(node_id) is not str:
+            raise LabError("node_id must be a string")
+        if type(scenario_id) is not str or scenario_id not in SCENARIO_IDS:
+            raise LabError(
+                "unsupported exercise scenario",
+                code="unsupported_scenario",
+            )
+        clean_actor = _validate_operator_actor(actor)
+        clean_idempotency_key = _validate_idempotency_key(idempotency_key)
+        definition = scenario_definition(scenario_id)
+        instant = time.monotonic() if now is None else now
+
+        with self._lock:
+            if clean_idempotency_key is not None:
+                previous = self._exercise_idempotency.get(clean_idempotency_key)
+                if previous is not None:
+                    previous_actor, previous_node, previous_scenario, exercise_id = previous
+                    if (
+                        previous_actor == clean_actor
+                        and previous_node == node_id
+                        and previous_scenario == scenario_id
+                    ):
+                        retained = self._exercises.get(exercise_id)
+                        if retained is not None:
+                            return self._public_exercise(retained)
+                    raise LabError(
+                        "Idempotency-Key was already used for a different exercise request",
+                        code="idempotency_conflict",
+                        status=409,
+                    )
+
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise LabError("node not found", code="not_found", status=404)
+            if not node["session_active"]:
+                raise LabError(
+                    "node session is closed; start a new node process",
+                    code="node_disconnected",
+                    status=409,
+                )
+            if node.get("tasking_paused"):
+                raise LabError(
+                    "node tasking is paused by containment",
+                    code="node_tasking_paused",
+                    status=409,
+                )
+            if node["profile"] != "purple_lab" or "RUN_PLAYBOOK" not in node["capabilities"]:
+                raise LabError(
+                    "exercise scenarios require a purple_lab node",
+                    code="capability_denied",
+                    status=409,
+                )
+            if len(self._exercises) >= MAX_EXERCISES:
+                raise LabError(
+                    "exercise retention limit reached; reset the lab",
+                    code="exercise_limit",
+                    status=429,
+                )
+
+            playbooks = definition["playbooks"]
+            queued_for_node = sum(
+                task["status"] == "queued" and task["node_id"] == node_id
+                for task in self._tasks.values()
+            )
+            queued_playbooks = sum(
+                task["status"] == "queued"
+                and task["node_id"] == node_id
+                and task["type"] == "RUN_PLAYBOOK"
+                for task in self._tasks.values()
+            )
+            if queued_for_node + len(playbooks) > MAX_QUEUED_TASKS_PER_NODE:
+                raise LabError("node queue limit reached", code="queue_limit", status=429)
+            if queued_playbooks + len(playbooks) > MAX_QUEUED_PLAYBOOKS_PER_NODE:
+                raise LabError(
+                    "purple-lab playbook queue limit reached",
+                    code="playbook_queue_limit",
+                    status=429,
+                )
+            if len(self._tasks) + len(playbooks) > MAX_TASKS:
+                raise LabError(
+                    "task limit reached; reset the lab",
+                    code="task_limit",
+                    status=429,
+                )
+
+            exercise_id = f"exercise-{uuid.uuid4().hex[:12]}"
+            timestamp = utc_now()
+            exercise = {
+                "id": exercise_id,
+                "scenario_id": scenario_id,
+                "title": definition["title"],
+                "description": definition["description"],
+                "scope": definition["scope"],
+                "status": "running",
+                "detection_status": "pending",
+                "node_id": node_id,
+                "created_by": clean_actor,
+                "created_at": timestamp,
+                "completed_at": None,
+                "task_ids": [],
+                "techniques": definition["techniques"],
+                "alerts": [],
+                "timeline": [],
+                "containment": {
+                    "status": "not_started",
+                    "action": None,
+                    "actor": None,
+                    "time": None,
+                },
+                "_timeline_sequence": 0,
+                "_observed_task_ids": [],
+                "_completion_recorded": False,
+            }
+            self._append_exercise_timeline_locked(
+                exercise,
+                phase="prepare",
+                kind="exercise.started",
+                summary=definition["title"],
+            )
+
+            for playbook in playbooks:
+                clean_type, clean_payload = _protocol_call(
+                    validate_task_payload,
+                    "RUN_PLAYBOOK",
+                    {"playbook": playbook},
+                )
+                task_id = f"task-{uuid.uuid4().hex[:12]}"
+                task = {
+                    "id": task_id,
+                    "correlation_id": f"corr-{uuid.uuid4().hex[:12]}",
+                    "node_id": node_id,
+                    "type": clean_type,
+                    "created_by": clean_actor,
+                    "payload": clean_payload,
+                    "status": "queued",
+                    "result": None,
+                    "created_at": utc_now(),
+                    "queue_ttl_seconds": DEFAULT_QUEUE_TTL_SECONDS,
+                    "dispatched_at": None,
+                    "completed_at": None,
+                    "delivery_attempts": 0,
+                    "_deadline": None,
+                    "_queue_deadline": instant + DEFAULT_QUEUE_TTL_SECONDS,
+                    "_idempotency_key": None,
+                    "_exercise_id": exercise_id,
+                }
+                self._tasks[task_id] = task
+                exercise["task_ids"].append(task_id)
+                self._append_exercise_timeline_locked(
+                    exercise,
+                    phase="prepare",
+                    kind="task.queued",
+                    summary=f"{playbook} queued",
+                    task_id=task_id,
+                )
+                self._record_locked(
+                    "task.queued",
+                    node_id=node_id,
+                    task_id=task_id,
+                    actor=clean_actor,
+                    data={"type": clean_type, "correlation_id": task["correlation_id"]},
+                )
+                self._audit_locked(
+                    "task.queued",
+                    actor=clean_actor,
+                    node_id=node_id,
+                    task_id=task_id,
+                    correlation_id=task["correlation_id"],
+                    task_type=clean_type,
+                    to_state="queued",
+                    outcome="accepted",
+                    reason="exercise_scenario",
+                )
+
+            self._exercises[exercise_id] = exercise
+            if clean_idempotency_key is not None:
+                self._exercise_idempotency[clean_idempotency_key] = (
+                    clean_actor,
+                    node_id,
+                    scenario_id,
+                    exercise_id,
+                )
+            self._record_locked(
+                "exercise.started",
+                node_id=node_id,
+                correlation_id=exercise_id,
+                actor=clean_actor,
+                data={
+                    "exercise_id": exercise_id,
+                    "scenario_id": scenario_id,
+                    "task_count": len(exercise["task_ids"]),
+                },
+            )
+            self._audit_locked(
+                "exercise.started",
+                actor=clean_actor,
+                node_id=node_id,
+                correlation_id=exercise_id,
+                outcome="accepted",
+                reason=scenario_id,
+            )
+            return self._public_exercise(exercise)
+
+    def contain_exercise(
+        self,
+        exercise_id: Any,
+        action: Any,
+        *,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
+    ) -> dict[str, Any]:
+        """Apply one control-plane-only response to a detected exercise."""
+
+        if type(exercise_id) is not str:
+            raise LabError("exercise_id must be a string")
+        if type(action) is not str or action not in CONTAINMENT_ACTIONS:
+            raise LabError("unsupported containment action", code="unsupported_action")
+        clean_actor = _validate_operator_actor(actor)
+        with self._lock:
+            exercise = self._exercises.get(exercise_id)
+            if exercise is None:
+                raise LabError("exercise not found", code="not_found", status=404)
+            if exercise["status"] == "contained":
+                if exercise["containment"]["action"] == action:
+                    return self._public_exercise(exercise)
+                raise LabError(
+                    "exercise already has a different containment action",
+                    code="containment_conflict",
+                    status=409,
+                )
+            if exercise["detection_status"] != "detected":
+                raise LabError(
+                    "containment requires a detected exercise",
+                    code="detection_required",
+                    status=409,
+                )
+
+            for task_id in exercise["task_ids"]:
+                task = self._tasks.get(task_id)
+                if task is None or task["status"] != "queued":
+                    continue
+                task["status"] = "cancelled"
+                task["result"] = {"reason": "exercise_contained"}
+                task["completed_at"] = utc_now()
+                task["_queue_deadline"] = None
+                self._record_locked(
+                    "task.cancelled",
+                    level="warning",
+                    node_id=task["node_id"],
+                    task_id=task_id,
+                    correlation_id=task["correlation_id"],
+                    actor=clean_actor,
+                    data={
+                        "type": task["type"],
+                        "correlation_id": task["correlation_id"],
+                        "reason": "exercise_contained",
+                    },
+                )
+                self._audit_locked(
+                    "task.cancelled",
+                    actor=clean_actor,
+                    node_id=task["node_id"],
+                    task_id=task_id,
+                    correlation_id=task["correlation_id"],
+                    task_type=task["type"],
+                    from_state="queued",
+                    to_state="cancelled",
+                    outcome="cancelled",
+                    reason="exercise_contained",
+                )
+
+            node = self._nodes.get(exercise["node_id"])
+            if action == "PAUSE_NODE_TASKING" and node is not None:
+                node["tasking_paused"] = True
+                node["tasking_paused_at"] = utc_now()
+                node["tasking_paused_by"] = clean_actor
+                self._record_locked(
+                    "node.tasking_paused",
+                    level="warning",
+                    node_id=node["id"],
+                    correlation_id=exercise_id,
+                    actor=clean_actor,
+                    data={"exercise_id": exercise_id},
+                )
+                self._audit_locked(
+                    "node.tasking_paused",
+                    actor=clean_actor,
+                    node_id=node["id"],
+                    correlation_id=exercise_id,
+                    from_state="active",
+                    to_state="paused",
+                    outcome="success",
+                    reason="exercise_containment",
+                )
+
+            contained_at = utc_now()
+            exercise["status"] = "contained"
+            if exercise["completed_at"] is None:
+                exercise["completed_at"] = contained_at
+            exercise["containment"] = {
+                "status": "applied",
+                "action": action,
+                "actor": clean_actor,
+                "time": contained_at,
+            }
+            for alert in exercise["alerts"]:
+                if alert["status"] == "open":
+                    alert["status"] = "contained"
+                    alert["contained_at"] = contained_at
+            self._append_exercise_timeline_locked(
+                exercise,
+                phase="contain",
+                kind="containment.applied",
+                summary="Control-plane containment applied",
+                action=action,
+            )
+            self._record_locked(
+                "exercise.contained",
+                level="warning",
+                node_id=exercise["node_id"],
+                correlation_id=exercise_id,
+                actor=clean_actor,
+                data={
+                    "exercise_id": exercise_id,
+                    "scenario_id": exercise["scenario_id"],
+                    "action": action,
+                    "alerts": len(exercise["alerts"]),
+                },
+            )
+            self._audit_locked(
+                "exercise.contained",
+                actor=clean_actor,
+                node_id=exercise["node_id"],
+                correlation_id=exercise_id,
+                from_state="detected",
+                to_state="contained",
+                outcome="success",
+                reason=action,
+            )
+            return self._public_exercise(exercise)
+
+    def exercises(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return sorted(
+                (self._public_exercise(exercise) for exercise in self._exercises.values()),
+                key=lambda exercise: exercise["created_at"],
+                reverse=True,
+            )
+
+    @staticmethod
+    def scenarios() -> list[dict[str, Any]]:
+        return scenario_catalog()
+
     def reset(self, *, actor: Any = DEFAULT_OPERATOR_ACTOR) -> None:
         clean_actor = _validate_operator_actor(actor)
         with self._lock:
             self._nodes.clear()
             self._tasks.clear()
+            self._exercises.clear()
             self._events.clear()
             self._note_idempotency.clear()
+            self._exercise_idempotency.clear()
             self._record_locked(
                 "lab.reset",
                 actor=clean_actor,
@@ -1083,6 +1618,7 @@ class LabState:
         with self._lock:
             nodes = self.nodes()
             tasks = self.tasks()
+            exercises = self.exercises()
             retained_events = list(self._events)
             retained_audit = list(self._audit_entries)
 
@@ -1138,9 +1674,11 @@ class LabState:
                 "stream_id": self._stream_id,
                 "lab_mode": True,
                 "protocol": "loopback-http-poll/v1",
-                "counts": self._counts(nodes, tasks),
+                "counts": self._counts(nodes, tasks, exercises),
                 "nodes": nodes,
                 "tasks": tasks,
+                "scenario_catalog": self.scenarios(),
+                "exercises": exercises,
                 "events": events,
                 "audit": audit_entries,
                 "cursors": {
@@ -1166,7 +1704,12 @@ class LabState:
             }
 
     @staticmethod
-    def _counts(nodes: list[dict[str, Any]], tasks: list[dict[str, Any]]) -> dict[str, int]:
+    def _counts(
+        nodes: list[dict[str, Any]],
+        tasks: list[dict[str, Any]],
+        exercises: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        exercise_records = exercises or []
         return {
             "nodes_online": sum(node["status"] == "online" for node in nodes),
             "nodes_total": len(nodes),
@@ -1177,18 +1720,37 @@ class LabState:
             "tasks_timeout": sum(task["status"] == "timeout" for task in tasks),
             "tasks_cancelled": sum(task["status"] == "cancelled" for task in tasks),
             "tasks_expired": sum(task["status"] == "expired" for task in tasks),
+            "exercises_total": len(exercise_records),
+            "exercises_running": sum(
+                exercise["status"] == "running" for exercise in exercise_records
+            ),
+            "exercises_detected": sum(
+                exercise["detection_status"] == "detected"
+                for exercise in exercise_records
+            ),
+            "exercises_contained": sum(
+                exercise["status"] == "contained" for exercise in exercise_records
+            ),
+            "alerts_open": sum(
+                alert["status"] == "open"
+                for exercise in exercise_records
+                for alert in exercise["alerts"]
+            ),
         }
 
     def overview(self) -> dict[str, Any]:
         with self._lock:
             nodes = self.nodes()
             tasks = self.tasks()
+            exercises = self.exercises()
             return {
                 "lab_mode": True,
                 "protocol": "loopback-http-poll/v1",
-                "counts": self._counts(nodes, tasks),
+                "counts": self._counts(nodes, tasks, exercises),
                 "nodes": nodes,
                 "tasks": tasks,
+                "scenario_catalog": self.scenarios(),
+                "exercises": exercises,
                 "events": self.events(),
             }
 
@@ -1198,6 +1760,7 @@ class LabState:
         with self._lock:
             nodes = self.nodes()
             tasks = self.tasks()
+            exercises = self.exercises()
             audit_entries = self.audit()
             safe_nodes = [
                 {
@@ -1213,6 +1776,9 @@ class LabState:
                         "last_seen",
                         "tasks_completed",
                         "tasks_failed",
+                        "tasking_paused",
+                        "tasking_paused_at",
+                        "tasking_paused_by",
                     )
                 }
                 for node in nodes
@@ -1236,7 +1802,7 @@ class LabState:
                 }
                 for task in tasks
             ]
-            counts = self._counts(nodes, tasks)
+            counts = self._counts(nodes, tasks, exercises)
             counts.update(
                 {
                     "events_retained": len(self._events),
@@ -1258,6 +1824,8 @@ class LabState:
                     "audit": MAX_AUDIT_ENTRIES,
                     "operator_notes": MAX_OPERATOR_NOTES_RETAINED,
                     "operator_note_length": MAX_OPERATOR_NOTE_LENGTH,
+                    "exercises": MAX_EXERCISES,
+                    "exercise_timeline": MAX_EXERCISE_TIMELINE,
                     "sync_page_size": MAX_SYNC_PAGE_SIZE,
                     "default_queue_ttl_seconds": DEFAULT_QUEUE_TTL_SECONDS,
                     "stale_session_ttl_seconds": STALE_SESSION_TTL_SECONDS,
@@ -1268,6 +1836,8 @@ class LabState:
                 },
                 "nodes": safe_nodes,
                 "tasks": safe_tasks,
+                "scenario_catalog": self.scenarios(),
+                "exercises": exercises,
                 "audit": audit_entries,
             }
 

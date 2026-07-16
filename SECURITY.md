@@ -96,8 +96,8 @@ Teamserver起動時に、次の三つのmemory-only sessionを発行します。
 
 | principal | role | permissions |
 | --- | --- | --- |
-| `local-admin` | `admin` | `read`, `task_write`, `note_write`, `reset`, `operator_admin` |
-| `task-operator` | `operator` | `read`, `task_write`, `note_write` |
+| `local-admin` | `admin` | `read`, `task_write`, `exercise_write`, `containment_write`, `note_write`, `reset`, `operator_admin` |
+| `task-operator` | `operator` | `read`, `task_write`, `exercise_write`, `note_write` |
 | `read-viewer` | `viewer` | `read` |
 
 各tokenは`Admin URL`、`Operator URL`、`Viewer URL`の`#token=...` fragmentとして一度だけ起動出力へ表示され、8時間で期限切れになります。URL fragment は通常の HTTP request や Referer へ含まれません。UI は token を読み取ると fragment を address bar から除去し、現在の tab の `sessionStorage` へ保持します。
@@ -145,6 +145,8 @@ task type は次の七種類だけです。
 - `HASH_TEXT`
 - `WAIT`
 - `GENERATE_EVENT`
+- `SLEEP`
+- `EXIT`
 - `RUN_PLAYBOOK`
 
 自由形式の command field はありません。各 payload は field の完全一致、型、文字数、値域を検証し、余分な field も拒否します。
@@ -162,6 +164,14 @@ Operator cancel APIは認証とlocalhost Originを要求し、`queued`だけを`
 task contractに一致しない初回resultは`invalid_result`として拒否し、taskを`dispatched`のまま保ちます。`task.result_rejected` event/auditには固定reasonだけを記録し、不正result、absolute path、raw content、exception textをコピーしません。
 
 Node client も Teamserver response を無条件には信用しません。enrollment response の Node ID と session token、poll response の task ID、correlation ID、Node ID、status、type、payload が期待する形式と固定 schema に一致することを確認してから保持・実行します。raw timeout や response 読込み中の切断も client error へ正規化し、foreground loop の再試行対象にします。
+
+Node executorはSLEEPの新しいpoll設定と`tasks_completed`を、Teamserverがresultを受理した後にだけcommitします。connection lossでは同じpending resultを再送し、timeout後の`409 invalid_task_state`など確定4xxではcommitせず破棄します。Nodeだけが先にpoll状態を変えてTeamserverのruntime identityと不整合になる経路を作りません。
+
+### ATT&CK exerciseとcontrol-plane containment
+
+exercise APIは`purple_lab` Node IDと固定scenario IDだけを受けます。scenarioは既存のfixture-only playbook二件から構成され、Operator定義rule、query、正規表現、path、step、host、contentを受けません。Teamserverはtask固有schemaを通過した`completed` resultに対応する固定signalだけからalertを作ります。mappingはeducational metadataであり、実環境の検知coverageを示しません。
+
+開始には`exercise_write`、containmentにはadminだけが持つ`containment_write`を要求します。containment actionは`CANCEL_REMAINING`と`PAUSE_NODE_TASKING`だけです。前者はscenarioのqueued taskを取消し、後者はさらにTeamserverのNode recordを`tasking_paused`へして新規queue / dispatchを拒否します。pollとsessionは維持し、OS process、firewall、account、network設定には触れません。解除はResetで行い、Resetはexerciseとidempotency stateも消去します。
 
 ## 非同期状態と障害処理
 
@@ -231,6 +241,7 @@ CLIのNodeとTeamserverは、`Ctrl-C`に加えて`SIGTERM`も同じgraceful shut
 | 全 task | 500。最古terminalだけをretention整理 |
 | 1 Node の queued task | 50 |
 | 1 Node の queued `RUN_PLAYBOOK` | 3 |
+| 保持 exercise | 50。固定timelineは各16件 |
 | queued task TTL | 既定300秒、指定時5〜86400秒 |
 | `Idempotency-Key` | 8〜128文字、英数字と`-_.:` |
 | `GET /lab/sync` page | event / auditそれぞれ1〜100件。short pollのみ |
@@ -276,6 +287,8 @@ Browser の `sessionStorage` は現在の tab での再読込に備えた一時 
 | task登録responseの消失・再送 | 任意`Idempotency-Key`で同一requestを一つのretained taskへ収束 | keyを省略した再送、Reset/restart/prune後の再送はdeduplicateしない |
 | path traversal / workspace escape | caller-supplied path/filenameなし、固定logical registry、exclusive temp file、regular-fileとcontainment検証 | sourceを変更できる同一userは対象外 |
 | playbook injection | 固定ID、exact schema、`purple_lab` profile、3件queue上限 | registryへ危険処理を追加しないreviewが必要 |
+| scenario / detection injection | 固定scenario、固定rule、validated completed resultからのみalert生成 | catalog変更時はplaybook mappingとのdrift reviewが必要 |
+| containmentの越権・過大作用 | admin-only permission、固定action、server-side tasking pauseだけ | OS / network isolationではなく教材上のcontrol-plane状態に限る |
 | crash後の一時artifact | synthetic dataのみ、正常終了・401時cleanup | 強制終了時はOS temp cleanupまで残る場合がある |
 | ATT&CK mappingの過大解釈 | educational metadataと明記 | detection coverageや実targetでのtechnique実行を保証しない |
 | resource exhaustion | 件数、size、worker、timeout、queue TTL、terminal-only retention上限 | 敵対的な同一 user 向け multi-tenant service ではない |

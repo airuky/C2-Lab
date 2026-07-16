@@ -84,7 +84,7 @@ class NodeExecutorTests(unittest.TestCase):
                 self.assertEqual(status, "failed")
                 self.assertEqual(result, {"error_code": "INVALID_TASK"})
 
-    def test_sleep_updates_executor_poll_state(self) -> None:
+    def test_sleep_updates_executor_poll_state_only_after_acknowledgement(self) -> None:
         executor = NodeExecutor(version="0.2.0", profile="training", poll_interval_ms=1_000)
         self.assertEqual(executor.poll_interval_ms, 1_000)
         self.assertEqual(executor.jitter_percent, 0)
@@ -95,8 +95,13 @@ class NodeExecutorTests(unittest.TestCase):
         self.assertEqual(result["previous_interval_ms"], 1_000)
         self.assertEqual(result["new_interval_ms"], 2000)
         self.assertEqual(result["jitter_percent"], 30)
+        self.assertEqual(executor.poll_interval_ms, 1000)
+        self.assertEqual(executor.jitter_percent, 0)
+        self.assertEqual(executor.tasks_completed, 0)
+        executor.acknowledge("SLEEP", status, result)
         self.assertEqual(executor.poll_interval_ms, 2000)
         self.assertEqual(executor.jitter_percent, 30)
+        self.assertEqual(executor.tasks_completed, 1)
 
     def test_exit_returns_acknowledged(self) -> None:
         status, result = self.executor.execute({"type": "EXIT", "payload": {}})
@@ -300,6 +305,76 @@ class NodeClientStateTests(unittest.TestCase):
         self.assertEqual(fake.poll_calls, 1)
         self.assertEqual(len(fake.submissions), 2)
         self.assertEqual(fake.submissions[0], fake.submissions[1])
+
+    def test_rejected_sleep_result_does_not_diverge_local_poll_state(self) -> None:
+        stop = threading.Event()
+
+        class FakeClient:
+            controller_url = "http://127.0.0.1:8765"
+
+            def __init__(self) -> None:
+                self.node_id = None
+                self.session_token = None
+
+            def enroll(self, **kwargs: object) -> dict[str, object]:
+                self.node_id = "node-" + "1" * 10
+                self.session_token = "session-token-123456"
+                return {"id": self.node_id}
+
+            def poll(self) -> dict[str, object]:
+                return {
+                    "task": {
+                        "id": "task-" + "2" * 12,
+                        "type": "SLEEP",
+                        "payload": {"interval_ms": 2000, "jitter_percent": 30},
+                    }
+                }
+
+            def submit_result(
+                self,
+                task_id: str,
+                status: str,
+                result: dict[str, object],
+            ) -> dict[str, object]:
+                stop.set()
+                raise NodeClientError(
+                    "task is no longer accepting a result",
+                    status=409,
+                    code="invalid_task_state",
+                )
+
+            def clear_session(self) -> None:
+                self.node_id = None
+                self.session_token = None
+
+            def disconnect(self) -> dict[str, object]:
+                return {"status": "offline"}
+
+        executor = NodeExecutor(
+            version="0.6.0",
+            profile="training",
+            poll_interval_ms=1000,
+        )
+        self.addCleanup(executor.close)
+        with (
+            mock.patch("c2lab.node.NodeClient", return_value=FakeClient()),
+            mock.patch("c2lab.node.NodeExecutor", return_value=executor),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = run_node(
+                controller_url="http://127.0.0.1:8765",
+                enrollment_token="enrollment-token-123456",
+                name="rejected-sleep-node",
+                version="0.6.0",
+                profile="training",
+                poll_interval_ms=1000,
+                stop_event=stop,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(executor.poll_interval_ms, 1000)
+        self.assertEqual(executor.jitter_percent, 0)
+        self.assertEqual(executor.tasks_completed, 0)
 
     def test_unauthorized_session_rotates_purple_workspace_before_reenrollment(self) -> None:
         stop = threading.Event()

@@ -19,7 +19,13 @@ class ObservabilityTests(unittest.TestCase):
             normalized_route("/lab/operators/session-123/revoke"),
             "/lab/operators/:session_id/revoke",
         )
+        self.assertEqual(
+            normalized_route("/lab/exercises/exercise-123/contain"),
+            "/lab/exercises/:exercise_id/contain",
+        )
         self.assertEqual(normalized_route("/lab/sync"), "/lab/sync")
+        self.assertEqual(normalized_route("/lab/scenarios"), "/lab/scenarios")
+        self.assertEqual(normalized_route("/lab/exercises"), "/lab/exercises")
         self.assertEqual(normalized_route("/lab/notes"), "/lab/notes")
         self.assertEqual(
             normalized_route("/lab/sync?events_after=query-secret"),

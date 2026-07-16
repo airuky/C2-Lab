@@ -320,13 +320,10 @@ class NodeExecutor:
                 time.sleep(payload["milliseconds"] / 1_000)
                 result = {"waited_ms": payload["milliseconds"]}
             elif task_type == "SLEEP":
-                previous = self.poll_interval_ms
-                self.poll_interval_ms = payload["interval_ms"]
-                self.jitter_percent = payload["jitter_percent"]
                 result = {
-                    "previous_interval_ms": previous,
-                    "new_interval_ms": self.poll_interval_ms,
-                    "jitter_percent": self.jitter_percent,
+                    "previous_interval_ms": self.poll_interval_ms,
+                    "new_interval_ms": payload["interval_ms"],
+                    "jitter_percent": payload["jitter_percent"],
                 }
             elif task_type == "EXIT":
                 result = {"acknowledged": True}
@@ -346,8 +343,24 @@ class NodeExecutor:
         except Exception:
             return "failed", {"error_code": "HANDLER_FAILED"}
 
-        self.tasks_completed += 1
         return "completed", result
+
+    def acknowledge(self, task_type: Any, status: Any, result: Any) -> None:
+        """Commit local runtime state only after Teamserver accepts a result."""
+
+        if status != "completed":
+            return
+        if not isinstance(task_type, str) or task_type not in capabilities_for_profile(self.profile):
+            raise ProtocolError("acknowledged task is outside the node profile")
+        if not isinstance(result, dict):
+            raise ProtocolError("acknowledged result must be an object")
+        if task_type == "SLEEP":
+            expected_keys = {"previous_interval_ms", "new_interval_ms", "jitter_percent"}
+            if set(result) != expected_keys or result["previous_interval_ms"] != self.poll_interval_ms:
+                raise ProtocolError("acknowledged sleep result does not match runtime state")
+            self.poll_interval_ms = validate_poll_interval(result["new_interval_ms"])
+            self.jitter_percent = validate_jitter_percent(result["jitter_percent"])
+        self.tasks_completed += 1
 
 
 def _jittered_wait(base_ms: int, jitter_percent: int, stop_event: threading.Event) -> None:
@@ -407,6 +420,11 @@ def run_node(
                 if pending_result is not None:
                     client.submit_result(
                         pending_result["task_id"],
+                        pending_result["status"],
+                        pending_result["result"],
+                    )
+                    executor.acknowledge(
+                        pending_result["task_type"],
                         pending_result["status"],
                         pending_result["result"],
                     )

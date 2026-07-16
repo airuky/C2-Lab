@@ -98,8 +98,8 @@ Teamserver 起動時の秘密分離、8時間のmemory-only Operator session、B
 
    | role | permissions |
    | --- | --- |
-   | `admin` | `read`, `task_write`, `note_write`, `reset`, `operator_admin` |
-   | `operator` | `read`, `task_write`, `note_write` |
+   | `admin` | `read`, `task_write`, `exercise_write`, `containment_write`, `note_write`, `reset`, `operator_admin` |
+   | `operator` | `read`, `task_write`, `exercise_write`, `note_write` |
    | `viewer` | `read` |
 
 7. viewerではtask登録・取消、共有メモ投稿、Resetが無効になり、operatorでは共有メモを投稿できる一方でResetが無効になることを確認します。これは補助表示であり、serverも有効sessionのpermission不足を`403 Forbidden`で拒否します。
@@ -694,7 +694,7 @@ beacon ベースの C2 では、check-in 間隔とジッター（ランダム幅
 6. task が completed になった後、Node terminal に `interval=2000ms jitter=40%` が表示されることを確認します。
 7. UI の Node card で `POLL` が `2000 ms ±40%` に更新されることを確認します。
 8. 再度 `RUNTIME_STATUS` を実行し、`poll_interval_ms: 2000` と `jitter_percent: 40` に変わったことを確認します。
-9. Events で `task.completed` の result に `previous_interval_ms`、`new_interval_ms`、`jitter_percent` が含まれることを確認します。
+9. Task detailのresultに`previous_interval_ms`、`new_interval_ms`、`jitter_percent`が含まれることを確認します。`task.completed` eventはtypeとcorrelationだけを持ち、result本文は複製しません。
 10. Node terminal で poll 間隔が実際に変わったことを、check-in のタイミングから観察します。
 
 ### バリデーション確認
@@ -716,6 +716,7 @@ python3 -m unittest tests.test_protocol.TaskResultContractTests.test_sleep_resul
 ### 確認問題
 
 - SLEEP の result が `new_interval_ms` と `previous_interval_ms` の両方を返す理由は何ですか。
+- Nodeが新しいpoll設定をTeamserverのresult acknowledgement後にだけcommitする理由を、timeout後の409とstate整合性から説明してください。
 - Teamserver の node record にも新しい `poll_interval_ms` と `jitter_percent` が反映される必要があるのはなぜですか。
 - ジッターを 50% に制限する理由と、制限がなかった場合に起こり得る問題を考えてください。
 - `basic` profile の Node で SLEEP を実行するとどうなりますか。code と test から確認してください。
@@ -780,6 +781,48 @@ python3 -m unittest tests.test_node.NodeExecutorTests.test_basic_profile_rejects
 
 EXIT task による遠隔正常停止が、result 送信 → disconnect → Node process 終了の順序で行われ、`Ctrl-C` と同じ graceful shutdown 経路を使うことを説明できること。
 
+## Lab 15: ATT&CK scenario、検知、封じ込め
+
+### 目的
+
+固定synthetic playbookの結果をATT&CK techniqueへ対応付け、Teamserverがdeterministic alertを生成し、adminがcontrol-plane containmentを適用する流れを観察します。実hostの監視や隔離は行いません。
+
+### 手順
+
+1. `purple_lab` Nodeを起動し、Admin URLとOperator URLを別tabで開きます。
+2. Operator tabの「ATT&CK演習」で`DISCOVERY_COLLECTION`を開始します。viewerでは開始できず、operatorは`exercise_write`で開始できることを確認します。
+3. 次の順序をTasks、ATT&CK演習、Eventsで追跡します。
+
+   ```text
+   exercise.started
+      ├─ DISCOVERY_FIXTURES completed ─> DET0370 / T1083 alert
+      └─ COLLECT_AND_STAGE completed ──> DET0380 / T1005 alert
+                                        DET0261 / T1074.001 alert
+   ```
+
+4. 最初のalertが出た時点でAdmin tabから`CANCEL_REMAINING`を適用し、残るscenario taskだけが`cancelled`になることを確認します。operator tabでは`containment_write`不足により操作できません。
+5. Reset後に同じscenarioを開始し、最初のalert後に`PAUSE_NODE_TASKING`を適用します。
+6. Nodeはpollを継続して`online`のままですが、UIに`TASKING PAUSED`が表示され、新規taskとexercise開始が無効になること、APIでも`409 node_tasking_paused`になることを確認します。
+7. ResetでNode / task / exercise / alert / pauseが消え、foreground Nodeが再登録することを確認します。
+8. `CANARY_REMOVAL`も実行し、`CREATE_CANARY`だけではalertが出ず、固定artifactの`CLEANUP`完了後だけDET0140 / T1070.004が記録されることを確認します。
+
+### 境界確認
+
+- scenario開始bodyは`node_id`と`scenario_id`だけで、余分な`steps`、`path`、`content`は400になる
+- alertは検証済み`completed` taskからのみ生成され、Node result内の任意ruleを信用しない
+- `PAUSE_NODE_TASKING`はTeamserverのqueue / dispatchだけを止め、OS process、firewall、account、network interfaceを変更しない
+- ATT&CK mappingはeducational metadataで、実環境の検知coverageを意味しない
+- exerciseは最大50件、timelineは各16件で、Reset / restart後に復元しない
+
+```console
+python3 -m unittest tests.test_exercises -v
+python3 -m unittest tests.test_server.OperatorRBACServerTests.test_exercise_api_enforces_catalog_schema_rbac_and_containment -v
+```
+
+### 完了条件
+
+fixed scenario → validated result → detection alert → admin containment → Resetという状態遷移と、実host操作を行わない境界を説明できること。
+
 ## まとめ課題
 
 次の問いへ、Current state、Events、terminal output、source/test のうち二種類以上を根拠として答えてください。
@@ -805,5 +848,8 @@ EXIT task による遠隔正常停止が、result 送信 → disconnect → Node
 18. EXIT taskによる遠隔停止と`Ctrl-C`による手動停止が同じgraceful shutdown経路を使う理由を、disconnect順序とqueued task cleanupから説明してください。
 19. SLEEPとEXITが`basic` profileで拒否される理由を、Node executorとTeamserverの二段階検証から説明してください。
 20. ジッターの上限が50%で、poll間隔が250〜3000 msに制限されている安全上の意味を説明してください。
+21. `exercise_write`と`containment_write`を分け、adminだけが`PAUSE_NODE_TASKING`を使える理由を説明してください。
+22. DET0370 / DET0380 / DET0261 / DET0140のmetadataと、教材固有signal / thresholdを区別してください。
+23. Nodeが`TASKING PAUSED`でもpollを続けることと、OS / network isolationではないことを対応付けてください。
 
-すべて説明できれば、中央 Teamserver、固定roleのOperator、foreground Node、poll、task/result、correlation、atomic cursor sync、共有note、bounded observability、SLEEP/EXIT遠隔制御、安全境界という本教材の主要概念を一通り確認できています。
+すべて説明できれば、中央 Teamserver、固定roleのOperator、foreground Node、poll、task/result、correlation、atomic cursor sync、共有note、bounded observability、SLEEP/EXIT、ATT&CK検知・control-plane containment、安全境界という本教材の主要概念を一通り確認できています。

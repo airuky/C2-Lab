@@ -676,12 +676,20 @@ class OperatorRBACServerTests(unittest.TestCase):
             ADMIN_TOKEN: (
                 "admin-user",
                 "admin",
-                {"read", "task_write", "note_write", "reset", "operator_admin"},
+                {
+                    "read",
+                    "task_write",
+                    "exercise_write",
+                    "containment_write",
+                    "note_write",
+                    "reset",
+                    "operator_admin",
+                },
             ),
             TASK_OPERATOR_TOKEN: (
                 "task-operator",
                 "operator",
-                {"read", "task_write", "note_write"},
+                {"read", "task_write", "exercise_write", "note_write"},
             ),
             VIEWER_TOKEN: ("read-viewer", "viewer", {"read"}),
         }
@@ -820,6 +828,109 @@ class OperatorRBACServerTests(unittest.TestCase):
                 self.assertEqual(payload["error"]["code"], "forbidden")
         admin_reset_status, _ = self.request("/lab/reset", method="POST", body={})
         self.assertEqual(admin_reset_status, 200)
+
+    def test_exercise_api_enforces_catalog_schema_rbac_and_containment(self) -> None:
+        catalog_status, catalog = self.request(
+            "/lab/scenarios",
+            authorization=self.bearer(VIEWER_TOKEN),
+        )
+        self.assertEqual(catalog_status, 200)
+        self.assertEqual(
+            {scenario["id"] for scenario in catalog},
+            {"DISCOVERY_COLLECTION", "CANARY_REMOVAL"},
+        )
+
+        client = NodeClient(self.base_url, ENROLLMENT_TOKEN)
+        client.enroll(
+            name="exercise-node",
+            version="0.7.0",
+            profile="purple_lab",
+            poll_interval_ms=500,
+        )
+        request_body = {
+            "node_id": client.node_id,
+            "scenario_id": "DISCOVERY_COLLECTION",
+        }
+        viewer_status, viewer_error = self.request(
+            "/lab/exercises",
+            method="POST",
+            body=request_body,
+            authorization=self.bearer(VIEWER_TOKEN),
+        )
+        self.assertEqual(viewer_status, 403)
+        self.assertEqual(viewer_error["error"]["code"], "forbidden")
+
+        invalid_status, invalid = self.request(
+            "/lab/exercises",
+            method="POST",
+            body={**request_body, "steps": []},
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+        )
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(invalid["error"]["code"], "invalid_request")
+
+        create_status, exercise = self.request(
+            "/lab/exercises",
+            method="POST",
+            body=request_body,
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+            headers={"Idempotency-Key": "exercise:http:001"},
+        )
+        retry_status, retry = self.request(
+            "/lab/exercises",
+            method="POST",
+            body=request_body,
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+            headers={"Idempotency-Key": "exercise:http:001"},
+        )
+        self.assertEqual(create_status, 201)
+        self.assertEqual(retry_status, 201)
+        self.assertEqual(retry["id"], exercise["id"])
+
+        executor = NodeExecutor(
+            version="0.7.0",
+            profile="purple_lab",
+            poll_interval_ms=500,
+        )
+        try:
+            task = client.poll()["task"]
+            status, result = executor.execute(task)
+            client.submit_result(task["id"], status, result)
+        finally:
+            executor.close()
+
+        operator_contain_status, operator_contain = self.request(
+            f"/lab/exercises/{exercise['id']}/contain",
+            method="POST",
+            body={"action": "PAUSE_NODE_TASKING"},
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+        )
+        self.assertEqual(operator_contain_status, 403)
+        self.assertEqual(operator_contain["error"]["code"], "forbidden")
+
+        contain_status, contained = self.request(
+            f"/lab/exercises/{exercise['id']}/contain",
+            method="POST",
+            body={"action": "PAUSE_NODE_TASKING"},
+        )
+        self.assertEqual(contain_status, 200)
+        self.assertEqual(contained["status"], "contained")
+        self.assertEqual(contained["containment"]["action"], "PAUSE_NODE_TASKING")
+
+        exercises_status, exercises = self.request(
+            "/lab/exercises",
+            authorization=self.bearer(VIEWER_TOKEN),
+        )
+        sync_status, sync = self.request(
+            "/lab/sync",
+            authorization=self.bearer(VIEWER_TOKEN),
+        )
+        self.assertEqual(exercises_status, 200)
+        self.assertEqual(sync_status, 200)
+        self.assertEqual(exercises[0]["id"], exercise["id"])
+        self.assertEqual(sync["exercises"][0]["status"], "contained")
+        self.assertEqual(sync["counts"]["alerts_open"], 0)
+        self.assertTrue(sync["nodes"][0]["tasking_paused"])
 
     def test_sync_requires_read_and_strictly_parses_bounded_decimal_query(self) -> None:
         with mock.patch.object(self.state, "sync", wraps=self.state.sync) as sync:

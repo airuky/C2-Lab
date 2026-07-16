@@ -124,7 +124,7 @@ queue TTL、queued taskの取消、task登録のidempotency key、terminal-only 
 Operator session、固定RBAC、liveness / readiness、bounded metrics、secret-free access log、graceful shutdownは、localhost教材の制御面を誤操作しにくく、状態を検証しやすくする独立のhardeningです。外部listener、remote operator、実target task、永続account、transport、payloadといった実運用C2能力を追加するものではありません。
 
 - Teamserver起動時だけ、8時間の`admin`、`operator`、`viewer` session URLを一つずつ発行し、refresh APIは設けない。expiry後は再起動で新URLを得る
-- role mappingを`admin = read + task_write + note_write + reset + operator_admin`、`operator = read + task_write + note_write`、`viewer = read`へ固定する
+- role mappingを`admin = read + task_write + exercise_write + containment_write + note_write + reset + operator_admin`、`operator = read + task_write + exercise_write + note_write`、`viewer = read`へ固定する
 - Teamserverにはraw Operator tokenではなくSHA-256 digestだけをmemory内で保持し、`GET /lab/session`とadmin-onlyの`GET /lab/operators`にもtokenを返さず、`POST /lab/operators/{session_id}/revoke`で個別失効する
 - 無効・期限切れ・失効済みsessionは401、有効でもpermission不足なら403に分ける
 - `/healthz`はpublic liveness、`/readyz`はpublic runtime readiness、`/lab/metrics`は認証済みread-only projectionとして責務を分ける
@@ -175,8 +175,12 @@ SSE、WebSocket、gRPC stream、long pollを使わないのは、remote multipla
 | `/lab/overview` | `read` | bounded KPIと全体snapshot、秘密なし |
 | `/lab/nodes` | `read` | session tokenと実host情報を含めない公開summary |
 | `GET /lab/tasks` | `read` | fixed taskだけのtyped ledger、bounded payload/result |
+| `GET /lab/scenarios` | `read` | fixed ATT&CK mapping、detection metadata、containment allowlist |
+| `GET /lab/exercises` | `read` | bounded alert / timeline / containment state |
 | `POST /lab/tasks` | `task_write` | strict payload、bounded queue TTL、任意idempotency key |
 | `POST /lab/tasks/{task_id}/cancel` | `task_write` | queued-only、冪等cancel |
+| `POST /lab/exercises` | `exercise_write` | purple_lab Nodeと固定scenario IDだけ。任意idempotency key |
+| `POST /lab/exercises/{exercise_id}/contain` | `containment_write` | admin-onlyのqueued取消またはserver-side tasking pause |
 | `POST /lab/notes` | `note_write` | 1〜240文字のmemory-only plain-text note。Nodeへ送らない |
 | `/lab/events` | `read` | bounded memory lifecycle history |
 | `/lab/audit` | `read` | sequence順、非永続、監査保証なし |

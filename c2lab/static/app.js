@@ -26,14 +26,7 @@ const EXERCISE_SCENARIO_IDS = new Set(
 );
 const CONTAINMENT_ACTIONS = new Set([
   "CANCEL_REMAINING",
-  "INVALIDATE_NODE_SESSION",
-]);
-const TERMINAL_EXERCISE_STATUSES = new Set([
-  "completed",
-  "complete",
-  "failed",
-  "cancelled",
-  "contained",
+  "PAUSE_NODE_TASKING",
 ]);
 
 const TASK_TEMPLATES = Object.freeze({
@@ -549,6 +542,7 @@ function renderExerciseNodes(nodes) {
       name: node.name,
       status: node.status,
       session_active: node.session_active,
+      tasking_paused: node.tasking_paused,
     })),
   );
   if (nodeKey === renderedExerciseNodeKey) return;
@@ -557,10 +551,10 @@ function renderExerciseNodes(nodes) {
   elements.exerciseNodeSelect.replaceChildren(new Option("purple_lab Node を選択", ""));
   for (const node of exerciseNodes) {
     const option = new Option(
-      `${node.name || node.id} · ${String(node.status || "unknown").toUpperCase()}`,
+      `${node.name || node.id} · ${node.tasking_paused ? "TASKING PAUSED" : String(node.status || "unknown").toUpperCase()}`,
       node.id,
     );
-    option.disabled = node.status !== "online";
+    option.disabled = node.status !== "online" || node.tasking_paused === true;
     elements.exerciseNodeSelect.add(option);
   }
   const previousOption = Array.from(elements.exerciseNodeSelect.options).find(
@@ -591,8 +585,13 @@ function exerciseAlertItem(alert) {
   item.className = "exercise-alert";
   const severity = recordText(alert, "severity", "level", "status").toLowerCase() || "info";
   item.dataset.severity = severity;
-  const title = recordText(alert, "title", "signal_id", "id", "kind") || "DETECTION ALERT";
-  const message = recordText(alert, "message", "description", "outcome") || compactJson(alert);
+  const title = recordText(alert, "name", "rule_id", "title", "id") || "DETECTION ALERT";
+  const alertMetadata = [
+    recordText(alert, "source_id"),
+    recordText(alert, "technique_id"),
+    recordText(alert, "signal", "signal_id"),
+  ].filter(Boolean);
+  const message = alertMetadata.join(" · ") || compactJson(alert);
   item.append(
     makeTextElement("strong", "", title),
     makeTextElement("p", "", message),
@@ -609,7 +608,7 @@ function exerciseTimelineItem(entry, index) {
   const body = document.createElement("div");
   const title = recordText(entry, "title", "label", "kind", "phase") || `STEP ${index + 1}`;
   const description =
-    recordText(entry, "message", "description", "outcome") || compactJson(entry);
+    recordText(entry, "summary", "message", "description", "outcome") || compactJson(entry);
   const metadata = [];
   const time = recordText(entry, "time", "timestamp", "created_at");
   const offset = recordText(entry, "offset_ms");
@@ -626,8 +625,12 @@ function exerciseTimelineItem(entry, index) {
   return item;
 }
 
-function isTerminalExercise(exercise) {
-  return TERMINAL_EXERCISE_STATUSES.has(String(exercise.status || "").toLowerCase());
+function canContainExercise(exercise) {
+  return (
+    String(exercise?.detection_status || "").toLowerCase() === "detected" &&
+    String(exercise?.status || "").toLowerCase() !== "contained" &&
+    String(exercise?.containment?.status || "").toLowerCase() !== "applied"
+  );
 }
 
 function createExerciseCard(exercise, nodeNames, scenarioTitles) {
@@ -728,7 +731,7 @@ function createExerciseCard(exercise, nodeNames, scenarioTitles) {
   actions.append(makeTextElement("span", "", "ADMIN CONTAINMENT"));
   const actionDefinitions = [
     ["CANCEL_REMAINING", "残りのタスクを取消"],
-    ["INVALIDATE_NODE_SESSION", "Node sessionを無効化"],
+    ["PAUSE_NODE_TASKING", "Node taskingを一時停止"],
   ];
   for (const [action, label] of actionDefinitions) {
     const button = makeTextElement("button", "button button--danger-ghost button--compact", label);
@@ -736,7 +739,7 @@ function createExerciseCard(exercise, nodeNames, scenarioTitles) {
     button.dataset.exerciseContain = "true";
     button.dataset.exerciseId = typeof exercise.id === "string" ? exercise.id : "";
     button.dataset.containmentAction = action;
-    button.dataset.exerciseTerminal = String(isTerminalExercise(exercise));
+    button.dataset.exerciseContainable = String(canContainExercise(exercise));
     button.addEventListener("click", () => containExercise(exercise.id, action, button));
     actions.append(button);
   }
@@ -821,6 +824,9 @@ function createNodeCard(node) {
   if (node.session_active === false) {
     badges.append(makeTextElement("span", "session-closed-badge", "SESSION CLOSED"));
   }
+  if (node.tasking_paused === true) {
+    badges.append(makeTextElement("span", "session-closed-badge", "TASKING PAUSED"));
+  }
   header.append(statusLight, identity, badges);
 
   const meta = document.createElement("div");
@@ -861,9 +867,13 @@ function createNodeCard(node) {
   actions.className = "node-card__actions";
   const selectButton = makeTextElement("button", "node-card__select", "選択してタスク作成");
   selectButton.type = "button";
-  selectButton.disabled = node.session_active === false;
+  selectButton.disabled = node.session_active === false || node.tasking_paused === true;
   selectButton.setAttribute("aria-label", `${node.name || "Node"} を選択して固定タスクを作成`);
-  if (selectButton.disabled) selectButton.title = "このNodeセッションは終了しています";
+  if (selectButton.disabled) {
+    selectButton.title = node.tasking_paused
+      ? "封じ込めによりNode taskingが一時停止中です"
+      : "このNodeセッションは終了しています";
+  }
   selectButton.addEventListener("click", () => selectNodeForTask(node.id));
   actions.append(counters, selectButton);
   footer.append(capabilities, actions);
@@ -898,19 +908,37 @@ function renderNodes(nodes) {
     elements.nodeList.append(createNodeCard(node));
     const label = `${node.name} · ${String(node.status).toUpperCase()} · ${node.profile}`;
     const option = new Option(
-      node.session_active === false ? `${label} · SESSION CLOSED` : label,
+      node.session_active === false
+        ? `${label} · SESSION CLOSED`
+        : node.tasking_paused
+          ? `${label} · TASKING PAUSED`
+          : label,
       node.id,
     );
-    option.disabled = node.session_active === false;
+    option.disabled = node.session_active === false || node.tasking_paused === true;
     elements.taskNodeSelect.add(option);
   }
 
-  if (nodes.some((node) => node.id === previousNodeId && node.session_active !== false)) {
+  if (nodes.some(
+    (node) =>
+      node.id === previousNodeId &&
+      node.session_active !== false &&
+      node.tasking_paused !== true,
+  )) {
     elements.taskNodeSelect.value = previousNodeId;
-  } else if (nodes.some((node) => node.session_active !== false)) {
+  } else if (nodes.some(
+    (node) => node.session_active !== false && node.tasking_paused !== true,
+  )) {
     const preferred =
-      nodes.find((node) => node.status === "online" && node.session_active !== false) ||
-      nodes.find((node) => node.session_active !== false);
+      nodes.find(
+        (node) =>
+          node.status === "online" &&
+          node.session_active !== false &&
+          node.tasking_paused !== true,
+      ) ||
+      nodes.find(
+        (node) => node.session_active !== false && node.tasking_paused !== true,
+      );
     elements.taskNodeSelect.value = preferred.id;
   }
   updateTaskCapabilities();
@@ -927,7 +955,13 @@ function updateSelectedNodeSummary(node) {
   elements.selectedNodeStatus.textContent = node ? String(node.status || "unknown").toUpperCase() : "—";
   elements.selectedNodeStatus.dataset.status = node?.status || "unknown";
   elements.selectedNodeProfile.textContent = node?.profile || "—";
-  elements.selectedNodeSession.textContent = node ? (node.session_active === false ? "CLOSED" : "ACTIVE") : "—";
+  elements.selectedNodeSession.textContent = node
+    ? node.session_active === false
+      ? "CLOSED"
+      : node.tasking_paused
+        ? "TASKING PAUSED"
+        : "ACTIVE"
+    : "—";
   const capabilities = Array.isArray(node?.capabilities) ? node.capabilities : [];
   elements.selectedNodeCapabilities.textContent = node
     ? `固定タスク: ${capabilities.length ? capabilities.join(" · ") : "なし"}`
@@ -955,7 +989,8 @@ function selectNodeForTask(nodeId) {
 function updateTaskCapabilities() {
   const node = selectedNode();
   const capabilities = new Set(Array.isArray(node?.capabilities) ? node.capabilities : []);
-  const sessionActive = Boolean(node) && node.session_active !== false;
+  const sessionActive =
+    Boolean(node) && node.session_active !== false && node.tasking_paused !== true;
   let selectedWasDisabled = false;
 
   for (const option of elements.taskTypeSelect.options) {
@@ -1260,12 +1295,14 @@ function updateControls() {
   const exerciseNodeAllowed =
     exerciseNode?.profile === "purple_lab" &&
     exerciseNode.session_active !== false &&
+    exerciseNode.tasking_paused !== true &&
     exerciseNode.status === "online";
   const node = selectedNode();
   const selectedType = elements.taskTypeSelect.value;
   const typeAllowed =
     Boolean(node) &&
     node.session_active !== false &&
+    node.tasking_paused !== true &&
     Array.isArray(node.capabilities) &&
     node.capabilities.includes(selectedType);
   elements.refreshButton.disabled =
@@ -1357,19 +1394,19 @@ function updateControls() {
   }
   for (const containButton of elements.exerciseList.querySelectorAll("[data-exercise-contain]")) {
     const actionAllowed = CONTAINMENT_ACTIONS.has(containButton.dataset.containmentAction);
-    const terminal = containButton.dataset.exerciseTerminal === "true";
+    const containable = containButton.dataset.exerciseContainable === "true";
     containButton.disabled =
       !hasToken ||
       !canContainExercises ||
       !actionAllowed ||
       !containButton.dataset.exerciseId ||
-      terminal ||
+      !containable ||
       containButton.dataset.busy === "true";
     containButton.setAttribute("aria-disabled", String(containButton.disabled));
     containButton.title = !canContainExercises
       ? "admin roleとcontainment_write権限が必要です。"
-      : terminal
-        ? "終了済みの演習です。"
+      : !containable
+        ? "検知後、未封じ込めの演習にだけ適用できます。"
         : "";
   }
 }
@@ -1761,12 +1798,12 @@ async function containExercise(exerciseId, action, button) {
     return;
   }
   const exercise = latestOverview?.exercises?.find((candidate) => candidate.id === exerciseId);
-  if (!exercise || isTerminalExercise(exercise)) {
-    showToast("この演習は終了済みか、現在の同期snapshotにありません。", "error");
+  if (!exercise || !canContainExercise(exercise)) {
+    showToast("検知後、未封じ込めの演習を選択してください。", "error");
     return;
   }
-  const confirmation = action === "INVALIDATE_NODE_SESSION"
-    ? "この演習のNode sessionを無効化しますか？同じsessionでは以後pollできません。"
+  const confirmation = action === "PAUSE_NODE_TASKING"
+    ? "このNodeの新規task dispatchをTeamserver上で一時停止しますか？解除はラボresetで行います。"
     : "この演習で未完了の固定タスクを取り消しますか？";
   if (!window.confirm(confirmation)) return;
 
@@ -1835,6 +1872,7 @@ elements.exerciseForm.addEventListener("submit", async (event) => {
     !node ||
     node.profile !== "purple_lab" ||
     node.session_active === false ||
+    node.tasking_paused === true ||
     node.status !== "online"
   ) {
     showToast("ONLINEかつsession有効なpurple_lab Nodeを選択してください。", "error");

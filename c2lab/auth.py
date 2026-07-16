@@ -16,9 +16,17 @@ from typing import Any, Mapping
 ROLE_PERMISSIONS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "admin": frozenset(
-            {"read", "task_write", "note_write", "reset", "operator_admin"}
+            {
+                "read",
+                "task_write",
+                "exercise_write",
+                "containment_write",
+                "note_write",
+                "reset",
+                "operator_admin",
+            }
         ),
-        "operator": frozenset({"read", "task_write", "note_write"}),
+        "operator": frozenset({"read", "task_write", "exercise_write", "note_write"}),
         "viewer": frozenset({"read"}),
     }
 )

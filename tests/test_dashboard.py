@@ -212,6 +212,28 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("elements.taskDetailDialog.open ||", self.javascript)
         self.assertIn('activeElement?.matches("input, select, textarea, summary")', self.javascript)
 
+    def test_attack_exercise_ui_uses_fixed_catalog_and_rbac_actions(self) -> None:
+        for element_id in (
+            "exercises",
+            "exerciseForm",
+            "exerciseNodeSelect",
+            "exerciseScenarioSelect",
+            "createExerciseButton",
+            "exerciseList",
+        ):
+            self.assertIn(f'id="{element_id}"', self.html)
+        self.assertIn('api("/lab/exercises"', self.javascript)
+        self.assertIn("/lab/exercises/${encodeURIComponent(exerciseId)}/contain", self.javascript)
+        self.assertIn('hasPermission("exercise_write")', self.javascript)
+        self.assertIn('hasPermission("containment_write")', self.javascript)
+        self.assertIn('"CANCEL_REMAINING"', self.javascript)
+        self.assertIn('"PAUSE_NODE_TASKING"', self.javascript)
+        self.assertNotIn("INVALIDATE_NODE_SESSION", self.javascript)
+        self.assertIn("node.tasking_paused !== true", self.javascript)
+        self.assertIn("canContainExercise(exercise)", self.javascript)
+        self.assertIn("overview.scenario_catalog", self.javascript)
+        self.assertIn("overview.exercises", self.javascript)
+
 
 if __name__ == "__main__":
     unittest.main()

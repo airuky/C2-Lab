@@ -26,17 +26,33 @@ class OperatorSessionRegistryTests(unittest.TestCase):
         self.assertEqual(
             ROLE_PERMISSIONS["admin"],
             frozenset(
-                {"read", "task_write", "note_write", "reset", "operator_admin"}
+                {
+                    "read",
+                    "task_write",
+                    "exercise_write",
+                    "containment_write",
+                    "note_write",
+                    "reset",
+                    "operator_admin",
+                }
             ),
         )
         self.assertEqual(
             ROLE_PERMISSIONS["operator"],
-            frozenset({"read", "task_write", "note_write"}),
+            frozenset({"read", "task_write", "exercise_write", "note_write"}),
         )
         self.assertEqual(ROLE_PERMISSIONS["viewer"], frozenset({"read"}))
         self.assertEqual(
             PERMISSIONS,
-            {"read", "task_write", "note_write", "reset", "operator_admin"},
+            {
+                "read",
+                "task_write",
+                "exercise_write",
+                "containment_write",
+                "note_write",
+                "reset",
+                "operator_admin",
+            },
         )
         with self.assertRaises(TypeError):
             ROLE_PERMISSIONS["admin"] = frozenset()  # type: ignore[index]

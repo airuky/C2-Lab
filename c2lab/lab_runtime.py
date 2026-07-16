@@ -16,6 +16,8 @@ import tempfile
 import threading
 from typing import Any, BinaryIO
 
+from .exercises import technique_identity
+
 
 PLAYBOOK_NAMES = (
     "DISCOVERY_FIXTURES",
@@ -64,22 +66,20 @@ _SCOPE = {
 _TECHNIQUES: dict[str, list[dict[str, str]]] = {
     "DISCOVERY_FIXTURES": [
         {
-            "id": "T1083",
-            "name": "File and Directory Discovery",
+            **technique_identity("T1083"),
             "emulation": "fixture-only",
         }
     ],
     "COLLECT_AND_STAGE": [
-        {"id": "T1005", "name": "Data from Local System", "emulation": "synthetic-only"},
+        {**technique_identity("T1005"), "emulation": "synthetic-only"},
         {
-            "id": "T1074.001",
-            "name": "Local Data Staging",
+            **technique_identity("T1074.001"),
             "emulation": "ephemeral-only",
         },
     ],
     "CREATE_CANARY": [],
     "CLEANUP": [
-        {"id": "T1070.004", "name": "File Deletion", "emulation": "lab-artifacts-only"}
+        {**technique_identity("T1070.004"), "emulation": "lab-artifacts-only"}
     ],
 }
 

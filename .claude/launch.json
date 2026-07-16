@@ -4,7 +4,7 @@
     {
       "name": "teamserver",
       "runtimeExecutable": "/Users/airuky/Documents/C2/.venv/bin/python3",
-      "runtimeArgs": ["/private/tmp/claude-501/-Users-airuky-Documents-C2/091c503f-d908-419c-a397-9cccc0f8cb1b/scratchpad/launch_teamserver.py"],
+      "runtimeArgs": ["-m", "c2lab", "teamserver", "--port", "8765"],
       "port": 8765
     }
   ]

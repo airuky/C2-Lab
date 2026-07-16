@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 
 import c2lab
 from c2lab.node import validate_controller_url
@@ -643,9 +645,29 @@ class SafetyBoundaryTests(unittest.TestCase):
 
         from c2lab.auth import ROLE_PERMISSIONS, ROLES
         self.assertEqual(ROLES, frozenset({"admin", "operator", "viewer"}))
-        self.assertIsInstance(ROLE_PERMISSIONS, type(ROLE_PERMISSIONS))
+        self.assertIsInstance(ROLE_PERMISSIONS, type(MappingProxyType({})))
         for role, perms in ROLE_PERMISSIONS.items():
             self.assertIsInstance(perms, frozenset)
+
+    def test_tracked_launcher_does_not_use_external_scripts_or_token_files(self) -> None:
+        """The optional launcher starts the package directly and never persists secrets."""
+
+        package = Path(c2lab.__file__).parent
+        launcher_path = package.parent / ".claude" / "launch.json"
+        if not launcher_path.exists():
+            return
+        launcher = json.loads(launcher_path.read_text(encoding="utf-8"))
+        configurations = launcher.get("configurations")
+        self.assertIsInstance(configurations, list)
+        self.assertGreater(len(configurations), 0)
+        for configuration in configurations:
+            self.assertEqual(
+                configuration.get("runtimeArgs"),
+                ["-m", "c2lab", "teamserver", "--port", "8765"],
+            )
+        serialized = json.dumps(launcher).lower()
+        for forbidden in ("scratchpad", "tokens.json", "/private/tmp", "/tmp/"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_no_multi_tenant_or_ha_vocabulary_in_source(self) -> None:
         """No clustering, replication, backup, or multi-tenant vocabulary."""

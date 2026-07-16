@@ -27,6 +27,33 @@ _SCOPE = {
     "attack_mapping": "educational-only",
 }
 
+_TECHNIQUE_METADATA = {
+    "T1083": {
+        "id": "T1083",
+        "name": "File and Directory Discovery",
+        "url": "https://attack.mitre.org/techniques/T1083/",
+    },
+    "T1005": {
+        "id": "T1005",
+        "name": "Data from Local System",
+        "url": "https://attack.mitre.org/techniques/T1005/",
+    },
+    "T1074.001": {
+        "id": "T1074.001",
+        "name": "Local Data Staging",
+        "url": "https://attack.mitre.org/techniques/T1074/001/",
+    },
+    "T1070.004": {
+        "id": "T1070.004",
+        "name": "File Deletion",
+        "url": "https://attack.mitre.org/techniques/T1070/004/",
+    },
+}
+
+
+def _technique(technique_id: str) -> dict[str, str]:
+    return copy.deepcopy(_TECHNIQUE_METADATA[technique_id])
+
 _SCENARIOS: dict[str, dict[str, Any]] = {
     "DISCOVERY_COLLECTION": {
         "id": "DISCOVERY_COLLECTION",
@@ -38,21 +65,9 @@ _SCENARIOS: dict[str, dict[str, Any]] = {
         "scope": _SCOPE,
         "playbooks": ["DISCOVERY_FIXTURES", "COLLECT_AND_STAGE"],
         "techniques": [
-            {
-                "id": "T1083",
-                "name": "File and Directory Discovery",
-                "url": "https://attack.mitre.org/techniques/T1083/",
-            },
-            {
-                "id": "T1005",
-                "name": "Data from Local System",
-                "url": "https://attack.mitre.org/techniques/T1005/",
-            },
-            {
-                "id": "T1074.001",
-                "name": "Local Data Staging",
-                "url": "https://attack.mitre.org/techniques/T1074/001/",
-            },
+            _technique("T1083"),
+            _technique("T1005"),
+            _technique("T1074.001"),
         ],
         "detections": [
             {
@@ -94,13 +109,7 @@ _SCENARIOS: dict[str, dict[str, Any]] = {
         ),
         "scope": _SCOPE,
         "playbooks": ["CREATE_CANARY", "CLEANUP"],
-        "techniques": [
-            {
-                "id": "T1070.004",
-                "name": "File Deletion",
-                "url": "https://attack.mitre.org/techniques/T1070/004/",
-            }
-        ],
+        "techniques": [_technique("T1070.004")],
         "detections": [
             {
                 "id": "C2LAB-DET-004",
@@ -143,3 +152,10 @@ def detections_for_playbook(
         for rule in _SCENARIOS[scenario_id]["detections"]
         if rule["playbook"] == playbook
     ]
+
+
+def technique_identity(technique_id: str) -> dict[str, str]:
+    """Return only the fixed ID/name pair used by playbook results."""
+
+    technique = _TECHNIQUE_METADATA[technique_id]
+    return {"id": technique["id"], "name": technique["name"]}
