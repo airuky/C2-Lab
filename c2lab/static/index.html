@@ -40,6 +40,37 @@
             <span class="api-state__dot" aria-hidden="true"></span>
             <span id="apiStateText">接続待ち</span>
           </div>
+          <details class="console-settings" id="consoleSettings">
+            <summary>表示設定</summary>
+            <div class="console-settings__panel">
+              <strong>コンソール表示</strong>
+              <label for="autoRefreshSelect">
+                <span>自動更新</span>
+                <select id="autoRefreshSelect">
+                  <option value="1000">1秒</option>
+                  <option value="3000" selected>3秒</option>
+                  <option value="5000">5秒</option>
+                  <option value="10000">10秒</option>
+                </select>
+              </label>
+              <label for="historyLimitSelect">
+                <span>履歴の表示件数</span>
+                <select id="historyLimitSelect">
+                  <option value="25">25件</option>
+                  <option value="50">50件</option>
+                  <option value="100" selected>100件</option>
+                </select>
+              </label>
+              <label for="densitySelect">
+                <span>表示密度</span>
+                <select id="densitySelect">
+                  <option value="comfortable" selected>ゆったり</option>
+                  <option value="compact">コンパクト</option>
+                </select>
+              </label>
+              <p>このタブのsessionStorageに保存します。</p>
+            </div>
+          </details>
           <button class="button button--quiet button--compact" id="refreshButton" type="button">
             <span aria-hidden="true">↻</span>
             <span>更新</span>
@@ -56,9 +87,11 @@
         <a href="#overview">概要</a>
         <a href="#nodes">Node</a>
         <a href="#dispatch">送信</a>
+        <a href="#graph">グラフ</a>
         <a href="#exercises">ATT&amp;CK演習</a>
         <a href="#tasks">結果</a>
         <a href="#events">履歴</a>
+        <a href="#boundaries">安全境界</a>
       </div>
     </nav>
 
@@ -264,29 +297,175 @@
                 <option value="RUN_PLAYBOOK">RUN_PLAYBOOK</option>
               </select>
             </label>
+
+            <section class="task-guidance" id="taskGuidance" aria-labelledby="taskGuidanceTitle">
+              <div class="task-guidance__heading">
+                <span>選択中のタスク</span>
+                <strong id="taskGuidanceTitle">PING</strong>
+              </div>
+              <div class="task-guidance__grid">
+                <div>
+                  <span>何をする</span>
+                  <p id="taskGuidanceAction">Nodeとの疎通を確認します。</p>
+                </div>
+                <div>
+                  <span>変更できる項目</span>
+                  <p id="taskGuidanceAdjustable">追加設定はありません。</p>
+                </div>
+                <div>
+                  <span>安全範囲</span>
+                  <p id="taskGuidanceSafety">固定応答のみ。ホスト情報やファイルには触れません。</p>
+                </div>
+              </div>
+            </section>
+
+            <fieldset class="queue-ttl-control">
+              <legend>キュー待機期限</legend>
+              <div class="queue-ttl-control__inputs">
+                <label class="field" for="queueTtlPresetSelect">
+                  <span class="field__label">Preset</span>
+                  <select id="queueTtlPresetSelect">
+                    <option value="30">30秒</option>
+                    <option value="300" selected>5分</option>
+                    <option value="1800">30分</option>
+                    <option value="custom">カスタム</option>
+                  </select>
+                </label>
+                <label class="field" id="queueTtlCustomField" for="queueTtlNumberInput" hidden>
+                  <span class="field__label">秒（5〜86400）</span>
+                  <input id="queueTtlNumberInput" type="number" min="5" max="86400" step="1" value="300" inputmode="numeric" aria-describedby="queueTtlError" disabled />
+                </label>
+              </div>
+              <p>Nodeへdispatchされるまでの待機期限です。dispatch後の実行期限やWAIT時間とは別です。</p>
+              <p class="field-error" id="queueTtlError" role="alert"></p>
+            </fieldset>
+
+            <div class="task-inputs" id="taskInputFields">
+              <div class="task-no-input" id="taskNoInput">
+                <span aria-hidden="true">✓</span>
+                <p><strong>追加設定はありません</strong>選択したNodeへ固定payloadを送信します。</p>
+              </div>
+
+              <label class="field" id="taskTextField" for="taskTextInput" hidden>
+                <span class="field__label field__label--split">
+                  <span>処理するテキスト</span>
+                  <small id="taskTextCharacterCount">0 / 240</small>
+                </span>
+                <textarea
+                  id="taskTextInput"
+                  rows="3"
+                  placeholder="1〜240文字"
+                  aria-describedby="taskTextCharacterCount payloadError"
+                  disabled
+                ></textarea>
+              </label>
+
+              <fieldset class="task-parameter" id="waitField" hidden>
+                <legend>待機時間</legend>
+                <div class="range-control">
+                  <input id="waitRangeInput" type="range" min="0" max="2000" step="1" value="750" aria-label="待機時間（ミリ秒）" aria-describedby="payloadError" disabled />
+                  <label for="waitNumberInput">
+                    <span class="visually-hidden">待機時間（ミリ秒）</span>
+                    <input id="waitNumberInput" type="number" min="0" max="2000" step="1" value="750" inputmode="numeric" aria-describedby="payloadError" disabled />
+                    <small>ms</small>
+                  </label>
+                </div>
+                <p>0〜2000ms。dispatch後にNodeプロセス内で待機します。</p>
+              </fieldset>
+
+              <div class="event-parameters" id="eventFields" hidden>
+                <label class="field" for="eventCategorySelect">
+                  <span class="field__label">Category</span>
+                  <select id="eventCategorySelect" aria-describedby="payloadError" disabled>
+                    <option value="training">training</option>
+                    <option value="telemetry">telemetry</option>
+                    <option value="policy">policy</option>
+                  </select>
+                </label>
+                <label class="field" for="eventSeveritySelect">
+                  <span class="field__label">Severity</span>
+                  <select id="eventSeveritySelect" aria-describedby="payloadError" disabled>
+                    <option value="info">info</option>
+                    <option value="warning">warning</option>
+                  </select>
+                </label>
+                <label class="field event-parameters__message" for="eventMessageInput">
+                  <span class="field__label field__label--split">
+                    <span>イベントメッセージ</span>
+                    <small id="eventMessageCharacterCount">0 / 240</small>
+                  </span>
+                  <textarea id="eventMessageInput" rows="3" aria-describedby="eventMessageCharacterCount payloadError" disabled></textarea>
+                </label>
+              </div>
+
+              <div class="sleep-parameters" id="sleepFields" hidden>
+                <fieldset class="task-parameter">
+                  <legend>Poll間隔</legend>
+                  <div class="range-control">
+                    <input id="sleepIntervalRangeInput" type="range" min="250" max="3000" step="1" value="2000" aria-label="Poll間隔（ミリ秒）" aria-describedby="payloadError" disabled />
+                    <label for="sleepIntervalNumberInput">
+                      <span class="visually-hidden">Poll間隔（ミリ秒）</span>
+                      <input id="sleepIntervalNumberInput" type="number" min="250" max="3000" step="1" value="2000" inputmode="numeric" aria-describedby="payloadError" disabled />
+                      <small>ms</small>
+                    </label>
+                  </div>
+                </fieldset>
+                <fieldset class="task-parameter">
+                  <legend>Jitter</legend>
+                  <div class="range-control">
+                    <input id="sleepJitterRangeInput" type="range" min="0" max="50" step="1" value="20" aria-label="Jitter（パーセント）" aria-describedby="payloadError" disabled />
+                    <label for="sleepJitterNumberInput">
+                      <span class="visually-hidden">Jitter（パーセント）</span>
+                      <input id="sleepJitterNumberInput" type="number" min="0" max="50" step="1" value="20" inputmode="numeric" aria-describedby="payloadError" disabled />
+                      <small>%</small>
+                    </label>
+                  </div>
+                </fieldset>
+              </div>
+
+              <div class="exit-confirmation" id="exitField" hidden>
+                <div>
+                  <span>停止理由</span>
+                  <strong>学習用foreground Nodeの正常停止</strong>
+                  <p>停止後は同じNodeセッションへタスクを送れません。</p>
+                </div>
+                <label for="exitConfirmInput">
+                  <input id="exitConfirmInput" type="checkbox" aria-describedby="payloadError" disabled />
+                  <span>影響を確認し、EXITを送信します</span>
+                </label>
+              </div>
+            </div>
+
             <label class="field" id="playbookField" for="playbookSelect" hidden>
               <span class="field__label">固定 Purple Lab Playbook</span>
-              <select id="playbookSelect" name="playbook">
+              <select id="playbookSelect" name="playbook" aria-describedby="payloadError" disabled>
                 <option value="DISCOVERY_FIXTURES">DISCOVERY_FIXTURES</option>
                 <option value="COLLECT_AND_STAGE">COLLECT_AND_STAGE</option>
                 <option value="CREATE_CANARY">CREATE_CANARY</option>
                 <option value="CLEANUP">CLEANUP</option>
               </select>
             </label>
-            <div class="field" id="taskPayloadField">
-              <span class="field__label field__label--split">
-                <label for="taskPayloadInput">Payload (JSON)</label>
-                <button class="text-button" id="restoreTemplateButton" type="button">テンプレートに戻す</button>
-              </span>
-              <textarea
-                id="taskPayloadInput"
-                name="payload"
-                rows="7"
-                required
-                spellcheck="false"
-                aria-describedby="payloadHint payloadError"
-              >{}</textarea>
-            </div>
+
+            <details class="payload-preview" id="taskPayloadField">
+              <summary>
+                <span>送信内容をJSONで確認</span>
+                <small>READ ONLY</small>
+              </summary>
+              <div class="field payload-preview__body">
+                <span class="field__label field__label--split">
+                  <label for="taskPayloadInput">同期済み Payload</label>
+                  <button class="text-button" id="restoreTemplateButton" type="button">初期値に戻す</button>
+                </span>
+                <textarea
+                  id="taskPayloadInput"
+                  name="payload_preview"
+                  rows="7"
+                  readonly
+                  spellcheck="false"
+                  aria-describedby="payloadHint payloadError"
+                >{}</textarea>
+              </div>
+            </details>
             <div class="payload-meta">
               <p id="payloadHint">Node との疎通を確認します。payload は空オブジェクトです。</p>
               <p class="field-error" id="payloadError" role="alert"></p>
@@ -298,10 +477,177 @@
         </article>
       </section>
 
+      <section class="panel panel--graph section-anchor" id="graph" aria-labelledby="graph-title">
+        <div class="panel__header panel__header--responsive">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">06</span> READ-ONLY RELATIONSHIP MAP</p>
+            <h2 id="graph-title">関係グラフとSynthetic Attack Path</h2>
+          </div>
+          <div class="graph-header-meta">
+            <span class="count-badge" id="graphEntityCountBadge">0 ENTITIES</span>
+            <span class="attack-tag">SYNTHETIC · READ ONLY</span>
+          </div>
+        </div>
+
+        <div class="graph-controls" aria-label="グラフ表示設定">
+          <label class="field" for="graphViewSelect">
+            <span class="field__label">View</span>
+            <select id="graphViewSelect">
+              <option value="topology">C2トポロジー</option>
+              <option value="attack">Synthetic Attack Path</option>
+            </select>
+          </label>
+          <label class="field graph-controls__focus" for="graphFocusSelect">
+            <span class="field__label">Focus</span>
+            <select id="graphFocusSelect">
+              <option value="all">すべてのNode</option>
+            </select>
+          </label>
+          <fieldset class="graph-zoom-control">
+            <legend>Zoom</legend>
+            <button class="icon-button" id="graphZoomOutButton" type="button" aria-label="グラフを縮小">−</button>
+            <label for="graphZoomInput">
+              <span class="visually-hidden">グラフの表示倍率</span>
+              <input id="graphZoomInput" type="range" min="10" max="160" step="10" value="100" />
+            </label>
+            <output id="graphZoomOutput" for="graphZoomInput">100%</output>
+            <button class="icon-button" id="graphZoomInButton" type="button" aria-label="グラフを拡大">＋</button>
+            <button class="button button--quiet button--compact" id="graphFitButton" type="button">全体表示</button>
+          </fieldset>
+        </div>
+
+        <p class="graph-boundary-note">
+          実環境の到達可能性や権限関係ではなく、localhostの固定Node・task・synthetic演習を読み取り専用で投影します。
+        </p>
+        <p class="graph-status" id="graphStatus" role="status" aria-live="polite">同期データを待機中です。</p>
+
+        <div class="graph-workspace">
+          <div class="graph-stage">
+            <div
+              class="graph-viewport"
+              id="graphViewport"
+              aria-label="関係グラフ。キーボード操作は下の関係リストを使用できます"
+            >
+              <svg
+                id="graphSvg"
+                role="img"
+                aria-labelledby="graphSvgTitle graphSvgDescription"
+                preserveAspectRatio="xMinYMin meet"
+              >
+                <title id="graphSvgTitle">C2 Lab relationship graph</title>
+                <desc id="graphSvgDescription">固定LABデータから作成した読み取り専用グラフです。</desc>
+              </svg>
+              <div class="empty-state empty-state--wide graph-empty" id="graphEmpty">
+                <span class="empty-state__mark" aria-hidden="true">⌁</span>
+                <strong>表示できる関係がありません</strong>
+                <p>Nodeを起動するか、固定scenarioを選択してください。</p>
+              </div>
+            </div>
+            <div class="graph-legend" aria-label="グラフ凡例">
+              <span><i data-graph-kind="teamserver" aria-hidden="true"></i>Teamserver</span>
+              <span><i data-graph-kind="node" aria-hidden="true"></i>Node</span>
+              <span><i data-graph-kind="task" aria-hidden="true"></i>Task / Playbook</span>
+              <span><i data-graph-kind="technique" aria-hidden="true"></i>ATT&amp;CK</span>
+              <span><i data-graph-kind="detection" aria-hidden="true"></i>Detection / Containment</span>
+              <span><b class="graph-legend__line" data-observed="false" aria-hidden="true"></b>PLANNED</span>
+              <span><b class="graph-legend__line" data-observed="true" aria-hidden="true"></b>OBSERVED</span>
+            </div>
+          </div>
+
+          <aside class="graph-inspector" id="graphInspector" aria-live="polite" aria-label="選択したentityの詳細">
+            <span class="graph-inspector__eyebrow">GRAPH INSPECTOR</span>
+            <h3>Entityを選択</h3>
+            <p>SVGまたは下の関係リストから選択すると、安全な同期済みmetadataを表示します。</p>
+          </aside>
+        </div>
+
+        <section class="graph-paths" aria-labelledby="graph-paths-title">
+          <div class="graph-paths__heading">
+            <div>
+              <span>KEYBOARD ACCESSIBLE</span>
+              <h3 id="graph-paths-title">関係と実行経路</h3>
+            </div>
+            <p>PLANNEDはcatalog由来、OBSERVEDは検証済みtask result・alert・containment由来です。</p>
+          </div>
+          <ol class="graph-path-list" id="graphPathList"></ol>
+        </section>
+
+        <section class="operation-builder" id="operationBuilder" aria-labelledby="operation-builder-title">
+          <div class="operation-builder__heading">
+            <div>
+              <span>BOUNDED AGENT OPERATION</span>
+              <h3 id="operation-builder-title">複数playbookを順番にキューへ登録</h3>
+              <p>既存の固定playbookを1〜3ステップで構成します。任意command・path・targetは追加できません。</p>
+            </div>
+            <button class="button button--quiet button--compact" id="operationLoadPathButton" type="button">
+              表示中のAttack Pathを読み込む
+            </button>
+          </div>
+
+          <form class="operation-form" id="operationForm">
+            <div class="operation-form__controls">
+              <label class="field" for="operationNodeSelect">
+                <span class="field__label">Purple Lab Node</span>
+                <select id="operationNodeSelect" required>
+                  <option value="">ONLINEなpurple_lab Nodeを選択</option>
+                </select>
+              </label>
+              <label class="field" for="operationTtlSelect">
+                <span class="field__label">各stepのQueue TTL</span>
+                <select id="operationTtlSelect">
+                  <option value="30">30秒</option>
+                  <option value="300" selected>5分</option>
+                  <option value="1800">30分</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="operation-step-heading">
+              <div>
+                <span>ORDERED STEPS</span>
+                <strong>Nodeには通常のRUN_PLAYBOOK taskとしてFIFO dispatchされます。</strong>
+              </div>
+              <output id="operationStepCount">2 / 3 STEPS</output>
+            </div>
+            <ol class="operation-step-list" id="operationStepList"></ol>
+
+            <div class="operation-add-step">
+              <label class="field" for="operationPlaybookSelect">
+                <span class="field__label">追加する固定playbook</span>
+                <select id="operationPlaybookSelect">
+                  <option value="DISCOVERY_FIXTURES">DISCOVERY_FIXTURES</option>
+                  <option value="COLLECT_AND_STAGE">COLLECT_AND_STAGE</option>
+                  <option value="CREATE_CANARY">CREATE_CANARY</option>
+                  <option value="CLEANUP">CLEANUP</option>
+                </select>
+              </label>
+              <button class="button button--quiet" id="operationAddStepButton" type="button">Stepを追加</button>
+            </div>
+
+            <details class="operation-preview">
+              <summary>Operation requestをJSONで確認 <small>READ ONLY</small></summary>
+              <textarea
+                id="operationPreviewInput"
+                rows="10"
+                readonly
+                spellcheck="false"
+                aria-label="Operation request JSON（読み取り専用）"
+                aria-describedby="operationHint operationError"
+              ></textarea>
+            </details>
+            <p class="operation-hint" id="operationHint">全stepを検証してからatomicに登録します。途中までの登録は行いません。</p>
+            <p class="field-error" id="operationError" role="alert"></p>
+            <button class="button button--primary button--full" id="operationSubmitButton" type="submit" disabled>
+              Operationを一括登録 <span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </section>
+      </section>
+
       <section class="panel panel--exercises section-anchor" id="exercises" aria-labelledby="exercises-title">
         <div class="panel__header panel__header--responsive">
           <div>
-            <p class="eyebrow"><span aria-hidden="true">06</span> ATT&amp;CK EXERCISE CONTROL</p>
+            <p class="eyebrow"><span aria-hidden="true">07</span> ATT&amp;CK EXERCISE CONTROL</p>
             <h2 id="exercises-title">検知つき固定演習</h2>
           </div>
           <div class="exercise-header-meta">
@@ -363,7 +709,7 @@
       <section class="panel panel--tasks section-anchor" id="tasks" aria-labelledby="tasks-title">
         <div class="panel__header panel__header--responsive">
           <div>
-            <p class="eyebrow"><span aria-hidden="true">07</span> CORRELATED TASKS</p>
+            <p class="eyebrow"><span aria-hidden="true">08</span> CORRELATED TASKS</p>
             <h2 id="tasks-title">タスクと結果</h2>
           </div>
           <div class="panel-tools">
@@ -393,7 +739,7 @@
             <thead>
               <tr>
                 <th scope="col">TASK ID</th>
-                <th scope="col">CORRELATION</th>
+                <th scope="col">CORRELATION / OPERATION</th>
                 <th scope="col">TYPE</th>
                 <th scope="col">NODE</th>
                 <th scope="col">STATUS</th>
@@ -415,7 +761,7 @@
       <section class="panel panel--events section-anchor" id="events" aria-labelledby="events-title">
         <div class="panel__header panel__header--responsive">
           <div>
-            <p class="eyebrow"><span aria-hidden="true">08</span> CONTROL-PLANE HISTORY</p>
+            <p class="eyebrow"><span aria-hidden="true">09</span> CONTROL-PLANE HISTORY</p>
             <h2 id="events-title">イベントと監査</h2>
           </div>
           <div class="panel-tools">
@@ -446,7 +792,7 @@
                 <option value="all">すべて</option>
               </select>
             </label>
-            <div class="live-label"><span aria-hidden="true"></span> 3秒ごとに自動更新</div>
+            <div class="live-label"><span aria-hidden="true"></span><span id="autoRefreshStatus">3秒ごとに自動更新</span></div>
           </div>
         </div>
         <form class="operator-note" id="noteForm" aria-labelledby="noteComposerTitle">
@@ -483,6 +829,139 @@
           <span class="empty-state__mark" aria-hidden="true">·</span>
           <strong id="eventsEmptyTitle">履歴を待機中</strong>
           <p id="eventsEmptyDescription">運用イベントまたはredacted監査台帳がここに表示されます。</p>
+        </div>
+      </section>
+
+      <section class="panel panel--boundaries section-anchor" id="boundaries" aria-labelledby="boundaries-title">
+        <div class="panel__header">
+          <div>
+            <p class="eyebrow"><span aria-hidden="true">10</span> SAFETY BOUNDARIES</p>
+            <h2 id="boundaries-title">不在の機能 — 安全境界</h2>
+          </div>
+          <span class="count-badge" id="boundaryCountBadge">13 BOUNDARIES</span>
+        </div>
+        <p class="boundaries-desc">
+          AST静的解析テストにより以下の機能が<strong>実装されていないこと</strong>を継続的に検証しています。
+          全31テストが各カテゴリの不在を強制します。
+        </p>
+        <div class="boundary-filter">
+          <button class="boundary-filter__btn is-active" data-boundary-filter="all" type="button" aria-pressed="true">すべて (13)</button>
+          <button class="boundary-filter__btn" data-boundary-filter="exec" type="button" aria-pressed="false">実行系</button>
+          <button class="boundary-filter__btn" data-boundary-filter="network" type="button" aria-pressed="false">通信系</button>
+          <button class="boundary-filter__btn" data-boundary-filter="persist" type="button" aria-pressed="false">永続化系</button>
+          <button class="boundary-filter__btn" data-boundary-filter="offensive" type="button" aria-pressed="false">攻撃系</button>
+        </div>
+        <div class="boundary-table-wrap">
+          <table class="boundary-table" id="boundaryTable">
+            <thead>
+              <tr>
+                <th>§</th>
+                <th>カテゴリ</th>
+                <th>不在の機能</th>
+                <th>テスト数</th>
+                <th>状態</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-boundary-group="exec">
+                <td class="boundary-id">§1</td>
+                <td>Shell / 実行</td>
+                <td>subprocess, os.system, eval, exec, Popen, shell 起動、任意コード実行</td>
+                <td class="center">1</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="exec">
+                <td class="boundary-id">§2</td>
+                <td>ファイル</td>
+                <td>ホストファイル読み書き、upload/download、file transfer、archive</td>
+                <td class="center">1</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="network">
+                <td class="boundary-id">§3</td>
+                <td>ネットワーク</td>
+                <td>外部 bind/connect、socket、HTTPS、WebSocket、SSE、long poll、proxy、redirect follow</td>
+                <td class="center">6</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="persist">
+                <td class="boundary-id">§4</td>
+                <td>永続化</td>
+                <td>DB (sqlite3 等)、pickle、config file、disk state、session 復元</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="exec">
+                <td class="boundary-id">§5</td>
+                <td>OS 偵察</td>
+                <td>端末名、プロセスID、利用者名、NIC情報、環境変数、OS情報、システム情報ライブラリ</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="offensive">
+                <td class="boundary-id">§6</td>
+                <td>Implant</td>
+                <td>fork, setsid, daemon 化、service 登録、cron、autostart、dropper</td>
+                <td class="center">3</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="offensive">
+                <td class="boundary-id">§7</td>
+                <td>Payload / Listener</td>
+                <td>shellcode, reverse_shell, bind_shell, payload 生成、listener、beacon、stager</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="network">
+                <td class="boundary-id">§8</td>
+                <td>Transport</td>
+                <td>外部 listener、relay、P2P、tunnel、remote operator 接続</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="offensive">
+                <td class="boundary-id">§9</td>
+                <td>回避</td>
+                <td>obfuscation、traffic shaping、detection evasion</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="exec">
+                <td class="boundary-id">§10</td>
+                <td>Plugin</td>
+                <td>runtime plugin、動的 module loading、extension</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="network">
+                <td class="boundary-id">§11</td>
+                <td>TLS</td>
+                <td>HTTPS（loopback 限定のため省略）</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="persist">
+                <td class="boundary-id">§12</td>
+                <td>Multi-tenant</td>
+                <td>永続 account、動的 RBAC、HA、backup/restore</td>
+                <td class="center">4</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+              <tr data-boundary-group="offensive">
+                <td class="boundary-id">§13</td>
+                <td>Remote</td>
+                <td>別物理端末の管理、remote administration</td>
+                <td class="center">2</td>
+                <td class="center"><span class="boundary-status boundary-status--enforced">ENFORCED</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="boundary-summary">
+          <span class="boundary-summary__item"><strong>31</strong> テスト</span>
+          <span class="boundary-summary__item"><strong>13</strong> カテゴリ</span>
+          <span class="boundary-summary__item"><strong>AST</strong> 静的解析</span>
+          <span class="boundary-summary__item boundary-summary__item--pass">ALL PASS</span>
         </div>
       </section>
     </main>

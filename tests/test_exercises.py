@@ -160,6 +160,54 @@ class AttackExerciseTests(unittest.TestCase):
             self.assertEqual(self.state.exercises()[0]["id"], exercise["id"])
             self.assertEqual(self.state.exercises()[0]["status"], "completed")
 
+    def test_contained_in_flight_result_keeps_technique_evidence_after_task_pruning(self) -> None:
+        with patch("c2lab.core.MAX_TASKS", 2):
+            exercise = self.state.start_exercise(self.node_id, "DISCOVERY_COLLECTION")
+            with EphemeralLabWorkspace() as workspace:
+                self.complete_next(workspace)
+                envelope = self.state.poll_node(self.node_id, self.session_token)
+                in_flight = envelope["task"]
+                self.assertIsNotNone(in_flight)
+                self.state.contain_exercise(exercise["id"], "CANCEL_REMAINING")
+                self.state.submit_result(
+                    self.node_id,
+                    self.session_token,
+                    in_flight["id"],
+                    "completed",
+                    workspace.execute(in_flight["payload"]["playbook"]),
+                )
+
+            retained = self.state.exercises()[0]
+            in_flight_techniques = {
+                item["technique_id"]
+                for item in retained["timeline"]
+                if item["kind"] == "technique.observed"
+                and item["task_id"] == in_flight["id"]
+            }
+            self.assertEqual(in_flight_techniques, {"T1005", "T1074.001"})
+            self.assertFalse(
+                any(alert["task_id"] == in_flight["id"] for alert in retained["alerts"])
+            )
+
+            self.state.queue_task(self.node_id, "PING", {})
+            self.state.queue_task(self.node_id, "PING", {})
+            self.assertTrue(
+                set(exercise["task_ids"]).isdisjoint(
+                    {task["id"] for task in self.state.tasks()}
+                )
+            )
+            after_pruning = self.state.exercises()[0]
+            self.assertEqual(
+                {
+                    item["technique_id"]
+                    for item in after_pruning["timeline"]
+                    if item["kind"] == "technique.observed"
+                    and item["task_id"] == in_flight["id"]
+                },
+                in_flight_techniques,
+            )
+            self.assertNotIn("result", json.dumps(after_pruning))
+
     def test_start_exercise_prunes_enough_eligible_terminal_tasks_atomically(self) -> None:
         with patch("c2lab.core.MAX_TASKS", 2):
             old_task_ids = set()
@@ -234,6 +282,17 @@ class AttackExerciseTests(unittest.TestCase):
         self.assertNotIn(self.session_token, serialized)
         self.assertNotIn("payload", serialized)
         self.assertNotIn("result", serialized)
+
+    def test_fixed_scenarios_fit_the_timeline_budget_with_retained_techniques(self) -> None:
+        for scenario in self.state.scenarios():
+            with self.subTest(scenario=scenario["id"]):
+                worst_case_entries = (
+                    3
+                    + 2 * len(scenario["playbooks"])
+                    + len(scenario["techniques"])
+                    + len(scenario["detections"])
+                )
+                self.assertLessEqual(worst_case_entries, MAX_EXERCISE_TIMELINE)
 
 
 if __name__ == "__main__":

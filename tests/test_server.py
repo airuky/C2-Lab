@@ -440,6 +440,142 @@ class LabServerTests(unittest.TestCase):
         self.assertFalse(submitted["result"]["scope"]["host_access"])
         self.assertNotIn("/tmp/", json.dumps(submitted))
 
+    def test_operation_api_queues_ordered_playbooks_idempotently(self) -> None:
+        client = self.make_node(profile="purple_lab")
+        body = {
+            "node_id": client.node_id,
+            "steps": [
+                {"playbook": "DISCOVERY_FIXTURES"},
+                {"playbook": "COLLECT_AND_STAGE"},
+            ],
+            "queue_ttl_seconds": 60,
+        }
+        headers = {"Idempotency-Key": "operation-http-0001"}
+
+        first_status, first = self.request(
+            "/lab/operations", method="POST", body=body, headers=headers
+        )
+        replay_status, replay = self.request(
+            "/lab/operations", method="POST", body=body, headers=headers
+        )
+        conflict_status, conflict = self.request(
+            "/lab/operations",
+            method="POST",
+            body={**body, "steps": list(reversed(body["steps"]))},
+            headers=headers,
+        )
+
+        self.assertEqual(first_status, 201)
+        self.assertEqual(replay_status, 201)
+        self.assertEqual(replay, first)
+        self.assertEqual(conflict_status, 409)
+        self.assertEqual(conflict["error"]["code"], "idempotency_conflict")
+        self.assertEqual(
+            set(first),
+            {"id", "node_id", "created_by", "steps", "tasks"},
+        )
+        self.assertEqual(first["node_id"], client.node_id)
+        self.assertEqual(first["created_by"], "local-admin")
+        self.assertEqual(first["steps"], body["steps"])
+        self.assertEqual(len(first["tasks"]), 2)
+        for position, task in enumerate(first["tasks"], start=1):
+            self.assertEqual(task["operation_id"], first["id"])
+            self.assertEqual(task["operation_step"], position)
+            self.assertEqual(task["queue_ttl_seconds"], 60)
+            self.assertNotIn("idempotency_key", task)
+        self.assertEqual(len(self.state.tasks()), 2)
+        self.assertEqual(
+            len([event for event in self.state.events() if event["kind"] == "operation.queued"]),
+            1,
+        )
+        operation_event = next(
+            event for event in self.state.events() if event["kind"] == "operation.queued"
+        )
+        operation_audit = next(
+            entry for entry in self.state.audit() if entry["action"] == "operation.queued"
+        )
+        self.assertNotIn("payload", operation_event)
+        self.assertNotIn("payload", operation_audit)
+        self.assertEqual(operation_event["data"]["step_count"], 2)
+        self.assertEqual(operation_audit["correlation_id"], first["id"])
+
+        polled = client.poll()["task"]
+        self.assertEqual(polled["payload"], body["steps"][0])
+        self.assertNotIn("operation_id", polled)
+        self.assertNotIn("operation_step", polled)
+
+    def test_operation_api_validation_and_queue_limits_are_atomic(self) -> None:
+        client = self.make_node(profile="purple_lab")
+        base = {"node_id": client.node_id}
+        invalid_bodies = (
+            {**base, "steps": [], "unexpected": True},
+            {**base, "steps": []},
+            {
+                **base,
+                "steps": [
+                    {"playbook": "DISCOVERY_FIXTURES"},
+                    {"playbook": "COLLECT_AND_STAGE"},
+                    {"playbook": "CREATE_CANARY"},
+                    {"playbook": "CLEANUP"},
+                ],
+            },
+            {**base, "steps": {"playbook": "DISCOVERY_FIXTURES"}},
+            {**base, "steps": [{"playbook": "UNKNOWN"}]},
+            {
+                **base,
+                "steps": [{"playbook": "DISCOVERY_FIXTURES", "command": "ignored"}],
+            },
+            {
+                **base,
+                "steps": [{"playbook": "DISCOVERY_FIXTURES"}],
+                "queue_ttl_seconds": False,
+            },
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                status, error = self.request(
+                    "/lab/operations", method="POST", body=body
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(error["error"]["code"], "invalid_request")
+                self.assertEqual(self.state.tasks(), [])
+
+        training = self.make_node(name="non-purple-operation-node", profile="training")
+        profile_status, profile_error = self.request(
+            "/lab/operations",
+            method="POST",
+            body={
+                "node_id": training.node_id,
+                "steps": [{"playbook": "DISCOVERY_FIXTURES"}],
+            },
+        )
+        self.assertEqual(profile_status, 409)
+        self.assertEqual(profile_error["error"]["code"], "capability_denied")
+        self.assertEqual(self.state.tasks(), [])
+
+        full_status, full = self.request(
+            "/lab/operations",
+            method="POST",
+            body={
+                **base,
+                "steps": [
+                    {"playbook": "DISCOVERY_FIXTURES"},
+                    {"playbook": "COLLECT_AND_STAGE"},
+                    {"playbook": "CREATE_CANARY"},
+                ],
+            },
+        )
+        overflow_status, overflow = self.request(
+            "/lab/operations",
+            method="POST",
+            body={**base, "steps": [{"playbook": "CLEANUP"}]},
+        )
+        self.assertEqual(full_status, 201)
+        self.assertEqual(len(full["tasks"]), 3)
+        self.assertEqual(overflow_status, 429)
+        self.assertEqual(overflow["error"]["code"], "playbook_queue_limit")
+        self.assertEqual(len(self.state.tasks()), 3)
+
     def test_forged_playbook_result_is_rejected_without_audit_leakage(self) -> None:
         client = self.make_node(profile="purple_lab")
         executor = NodeExecutor(version="0.3.0", profile="purple_lab", poll_interval_ms=500)
@@ -697,9 +833,14 @@ class OperatorRBACServerTests(unittest.TestCase):
         with response:
             return response.status, json.loads(response.read())
 
-    def make_node(self) -> NodeClient:
+    def make_node(self, *, profile: str = "training") -> NodeClient:
         client = NodeClient(self.base_url, ENROLLMENT_TOKEN)
-        client.enroll(name="rbac-node", version="0.2.0", profile="training", poll_interval_ms=500)
+        client.enroll(
+            name="rbac-node",
+            version="0.2.0",
+            profile=profile,
+            poll_interval_ms=500,
+        )
         return client
 
     @staticmethod
@@ -920,6 +1061,61 @@ class OperatorRBACServerTests(unittest.TestCase):
         admin_reset_status, _ = self.request("/lab/reset", method="POST", body={})
         self.assertEqual(admin_reset_status, 200)
 
+    def test_operation_api_requires_task_write_and_binds_idempotency_to_actor(self) -> None:
+        client = self.make_node(profile="purple_lab")
+        body = {
+            "node_id": client.node_id,
+            "steps": [{"playbook": "DISCOVERY_FIXTURES"}],
+        }
+        headers = {"Idempotency-Key": "operation-rbac-0001"}
+
+        viewer_status, viewer_error = self.request(
+            "/lab/operations",
+            method="POST",
+            body=body,
+            authorization=self.bearer(VIEWER_TOKEN),
+            headers=headers,
+        )
+        operator_status, operation = self.request(
+            "/lab/operations",
+            method="POST",
+            body=body,
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+            headers=headers,
+        )
+        actor_conflict_status, actor_conflict = self.request(
+            "/lab/operations",
+            method="POST",
+            body=body,
+            authorization=self.bearer(ADMIN_TOKEN),
+            headers=headers,
+        )
+        origin_status, origin_error = self.request(
+            "/lab/operations",
+            method="POST",
+            body=body,
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+            headers={
+                "Idempotency-Key": "operation-rbac-0002",
+                "Origin": "https://example.invalid",
+            },
+        )
+
+        self.assertEqual(viewer_status, 403)
+        self.assertEqual(viewer_error["error"]["code"], "forbidden")
+        self.assertEqual(operator_status, 201)
+        self.assertEqual(operation["created_by"], "task-operator")
+        self.assertEqual(operation["tasks"][0]["created_by"], "task-operator")
+        self.assertEqual(actor_conflict_status, 409)
+        self.assertEqual(actor_conflict["error"]["code"], "idempotency_conflict")
+        self.assertEqual(origin_status, 403)
+        self.assertEqual(origin_error["error"]["code"], "invalid_origin")
+        self.assertEqual(len(self.state.tasks()), 1)
+        operation_audit = next(
+            entry for entry in self.state.audit() if entry["action"] == "operation.queued"
+        )
+        self.assertEqual(operation_audit["actor"], "task-operator")
+
     def test_exercise_api_enforces_catalog_schema_rbac_and_containment(self) -> None:
         catalog_status, catalog = self.request(
             "/lab/scenarios",
@@ -1007,6 +1203,12 @@ class OperatorRBACServerTests(unittest.TestCase):
         self.assertEqual(contain_status, 200)
         self.assertEqual(contained["status"], "contained")
         self.assertEqual(contained["containment"]["action"], "PAUSE_NODE_TASKING")
+        cancelled_timeline = [
+            item for item in contained["timeline"] if item["kind"] == "task.cancelled"
+        ]
+        self.assertEqual(len(cancelled_timeline), 1)
+        self.assertEqual(cancelled_timeline[0]["task_id"], exercise["task_ids"][1])
+        self.assertEqual(cancelled_timeline[0]["summary"], "COLLECT_AND_STAGE cancelled")
 
         exercises_status, exercises = self.request(
             "/lab/exercises",
@@ -1022,6 +1224,62 @@ class OperatorRBACServerTests(unittest.TestCase):
         self.assertEqual(sync["exercises"][0]["status"], "contained")
         self.assertEqual(sync["counts"]["alerts_open"], 0)
         self.assertTrue(sync["nodes"][0]["tasking_paused"])
+
+    def test_contained_exercise_retains_terminal_evidence_from_dispatched_task(self) -> None:
+        client = NodeClient(self.base_url, ENROLLMENT_TOKEN)
+        client.enroll(
+            name="containment-inflight-node",
+            version="0.7.0",
+            profile="purple_lab",
+            poll_interval_ms=500,
+        )
+        create_status, exercise = self.request(
+            "/lab/exercises",
+            method="POST",
+            body={
+                "node_id": client.node_id,
+                "scenario_id": "DISCOVERY_COLLECTION",
+            },
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+        )
+        self.assertEqual(create_status, 201)
+
+        executor = NodeExecutor(
+            version="0.7.0",
+            profile="purple_lab",
+            poll_interval_ms=500,
+        )
+        try:
+            first = client.poll()["task"]
+            first_status, first_result = executor.execute(first)
+            client.submit_result(first["id"], first_status, first_result)
+
+            in_flight = client.poll()["task"]
+            self.assertEqual(in_flight["id"], exercise["task_ids"][1])
+            contain_status, contained = self.request(
+                f"/lab/exercises/{exercise['id']}/contain",
+                method="POST",
+                body={"action": "CANCEL_REMAINING"},
+            )
+            self.assertEqual(contain_status, 200)
+            self.assertEqual(contained["status"], "contained")
+
+            second_status, second_result = executor.execute(in_flight)
+            client.submit_result(in_flight["id"], second_status, second_result)
+        finally:
+            executor.close()
+
+        exercises_status, exercises = self.request("/lab/exercises")
+        self.assertEqual(exercises_status, 200)
+        retained = next(item for item in exercises if item["id"] == exercise["id"])
+        self.assertEqual(retained["status"], "contained")
+        terminal_items = [
+            item
+            for item in retained["timeline"]
+            if item["task_id"] == in_flight["id"] and item["kind"] == "task.completed"
+        ]
+        self.assertEqual(len(terminal_items), 1)
+        self.assertEqual(terminal_items[0]["summary"], "COLLECT_AND_STAGE completed")
 
     def test_sync_requires_read_and_strictly_parses_bounded_decimal_query(self) -> None:
         with mock.patch.object(self.state, "sync", wraps=self.state.sync) as sync:
@@ -1233,7 +1491,7 @@ class OperatorRBACServerTests(unittest.TestCase):
         self.assertEqual(reset_entry["actor"], "admin-user")
 
     def test_ready_and_metrics_are_aggregate_and_secret_free(self) -> None:
-        client = self.make_node()
+        client = self.make_node(profile="purple_lab")
         queued_status, queued = self.request(
             "/lab/tasks",
             method="POST",
@@ -1248,6 +1506,16 @@ class OperatorRBACServerTests(unittest.TestCase):
             authorization=self.bearer(TASK_OPERATOR_TOKEN),
         )
         self.assertEqual(cancel_status, 200)
+        operation_status, operation = self.request(
+            "/lab/operations",
+            method="POST",
+            body={
+                "node_id": client.node_id,
+                "steps": [{"playbook": "DISCOVERY_FIXTURES"}],
+            },
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+        )
+        self.assertEqual(operation_status, 201)
         raw_dynamic_path = "/attacker-secret-segment/private/value"
         raw_status, _ = self.request(
             raw_dynamic_path, authorization=self.bearer(VIEWER_TOKEN)
@@ -1273,6 +1541,7 @@ class OperatorRBACServerTests(unittest.TestCase):
         self.assertGreaterEqual(
             metrics["http"]["routes"]["/lab/tasks/:task_id/cancel"], 1
         )
+        self.assertGreaterEqual(metrics["http"]["routes"]["/lab/operations"], 1)
         self.assertGreaterEqual(metrics["http"]["routes"]["unmatched"], 1)
         self.assertEqual(denied_metrics_status, 401)
 
@@ -1293,6 +1562,8 @@ class OperatorRBACServerTests(unittest.TestCase):
             client.session_token or "missing-node-session",
             client.node_id or "missing-node-id",
             queued["id"],
+            operation["id"],
+            operation["tasks"][0]["id"],
             raw_dynamic_path,
             "attacker-secret-segment",
         )
@@ -1300,7 +1571,7 @@ class OperatorRBACServerTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
 
     def test_structured_access_log_uses_normalized_routes_and_principals(self) -> None:
-        client = self.make_node()
+        client = self.make_node(profile="purple_lab")
         client.poll()
         queued_status, queued = self.request(
             "/lab/tasks",
@@ -1316,6 +1587,16 @@ class OperatorRBACServerTests(unittest.TestCase):
             authorization=self.bearer(TASK_OPERATOR_TOKEN),
         )
         self.assertEqual(cancel_status, 200)
+        operation_status, operation = self.request(
+            "/lab/operations",
+            method="POST",
+            body={
+                "node_id": client.node_id,
+                "steps": [{"playbook": "DISCOVERY_FIXTURES"}],
+            },
+            authorization=self.bearer(TASK_OPERATOR_TOKEN),
+        )
+        self.assertEqual(operation_status, 201)
         ready_status, _ = self.request("/readyz", authorization=None)
         self.assertEqual(ready_status, 200)
         raw_dynamic_path = "/raw-secret-segment/nested"
@@ -1349,6 +1630,12 @@ class OperatorRBACServerTests(unittest.TestCase):
         self.assertEqual(cancel_entry["method"], "POST")
         self.assertEqual(cancel_entry["status"], 200)
         self.assertEqual(cancel_entry["principal_id"], "task-operator")
+        operation_entry = next(
+            entry for entry in entries if entry["route"] == "/lab/operations"
+        )
+        self.assertEqual(operation_entry["method"], "POST")
+        self.assertEqual(operation_entry["status"], 201)
+        self.assertEqual(operation_entry["principal_id"], "task-operator")
         self.assertEqual(
             next(entry for entry in entries if entry["route"] == "/node/v1/enroll")[
                 "principal_id"
@@ -1383,6 +1670,8 @@ class OperatorRBACServerTests(unittest.TestCase):
             client.session_token or "missing-node-session",
             client.node_id or "missing-node-id",
             queued["id"],
+            operation["id"],
+            operation["tasks"][0]["id"],
             raw_dynamic_path,
             "raw-secret-segment",
             *(session["id"] for session in self.sessions.values()),

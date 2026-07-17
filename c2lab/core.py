@@ -40,6 +40,8 @@ MAX_NODES = 20
 MAX_TASKS = 500
 MAX_QUEUED_TASKS_PER_NODE = 50
 MAX_QUEUED_PLAYBOOKS_PER_NODE = 3
+MAX_OPERATION_STEPS = 3
+MAX_OPERATION_IDEMPOTENCY_RECORDS = MAX_TASKS
 MAX_EVENTS = 500
 MAX_AUDIT_ENTRIES = 500
 MAX_OPERATOR_NOTES_RETAINED = 100
@@ -125,6 +127,23 @@ def _validate_operator_actor(value: Any) -> str:
     return value
 
 
+def _validate_operation_steps(value: Any) -> list[dict[str, str]]:
+    if type(value) is not list or not 1 <= len(value) <= MAX_OPERATION_STEPS:
+        raise LabError(f"steps must be a list of 1 to {MAX_OPERATION_STEPS} playbooks")
+    clean_steps: list[dict[str, str]] = []
+    for index, step in enumerate(value):
+        if type(step) is not dict or set(step) != {"playbook"}:
+            raise LabError(
+                f"steps[{index}] must be an object containing only playbook"
+            )
+        try:
+            _task_type, clean_payload = validate_task_payload("RUN_PLAYBOOK", step)
+        except ProtocolError as error:
+            raise LabError(str(error)) from error
+        clean_steps.append(clean_payload)
+    return clean_steps
+
+
 def _validate_sync_cursor(value: Any, field: str) -> int:
     if (
         not isinstance(value, int)
@@ -175,6 +194,7 @@ class LabState:
         self._note_idempotency: dict[str, tuple[str, str, str]] = {}
         self._exercises: dict[str, dict[str, Any]] = {}
         self._exercise_idempotency: dict[str, tuple[str, str, str, str]] = {}
+        self._operation_idempotency: dict[str, dict[str, Any]] = {}
         self._event_sequence = 0
         self._audit_sequence = 0
         self._task_sequence = 0
@@ -739,6 +759,18 @@ class LabState:
         for task in candidates[:slots_to_free]:
             self._prune_terminal_task_locked(task)
 
+    def _operation_idempotency_record_is_evictable_locked(
+        self,
+        record: dict[str, Any],
+    ) -> bool:
+        """Keep replay records while any task in the operation is still live."""
+
+        return all(
+            (task := self._tasks.get(task_id)) is None
+            or task["status"] in TERMINAL_TASK_STATUSES
+            for task_id in record["task_ids"]
+        )
+
     def queue_task(
         self,
         node_id: Any,
@@ -870,6 +902,201 @@ class LabState:
                 outcome="accepted",
             )
             return self._public_task(task)
+
+    def queue_operation(
+        self,
+        node_id: Any,
+        steps: Any,
+        *,
+        queue_ttl_seconds: Any = _UNSET,
+        idempotency_key: Any = None,
+        actor: Any = DEFAULT_OPERATOR_ACTOR,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically queue an ordered, bounded set of fixed purple-lab playbooks."""
+
+        if not isinstance(node_id, str):
+            raise LabError("node_id must be a string")
+        clean_steps = _validate_operation_steps(steps)
+        clean_ttl = _validate_queue_ttl(queue_ttl_seconds)
+        clean_idempotency_key = _validate_idempotency_key(idempotency_key)
+        clean_actor = _validate_operator_actor(actor)
+        instant = time.monotonic() if now is None else now
+        playbooks = tuple(step["playbook"] for step in clean_steps)
+
+        with self._lock:
+            idempotency_eviction_keys: list[str] = []
+            if clean_idempotency_key is not None:
+                previous = self._operation_idempotency.get(clean_idempotency_key)
+                if previous is not None:
+                    same_request = (
+                        previous["actor"] == clean_actor
+                        and previous["node_id"] == node_id
+                        and previous["playbooks"] == playbooks
+                        and previous["queue_ttl_seconds"] == clean_ttl
+                    )
+                    if same_request:
+                        return copy.deepcopy(previous["summary"])
+                    raise LabError(
+                        "Idempotency-Key was already used for a different operation request",
+                        code="idempotency_conflict",
+                        status=409,
+                    )
+
+            node = self._nodes.get(node_id)
+            if node is None:
+                raise LabError("node not found", code="not_found", status=404)
+            if not node["session_active"]:
+                raise LabError(
+                    "node session is closed; start a new node process",
+                    code="node_disconnected",
+                    status=409,
+                )
+            if node["status"] != "online":
+                raise LabError(
+                    "operation requires an online node",
+                    code="node_offline",
+                    status=409,
+                )
+            if node.get("tasking_paused"):
+                raise LabError(
+                    "node tasking is paused by containment",
+                    code="node_tasking_paused",
+                    status=409,
+                )
+            if node["profile"] != "purple_lab" or "RUN_PLAYBOOK" not in node["capabilities"]:
+                raise LabError(
+                    "operations require a purple_lab node",
+                    code="capability_denied",
+                    status=409,
+                )
+
+            queued_for_node = sum(
+                task["status"] == "queued" and task["node_id"] == node_id
+                for task in self._tasks.values()
+            )
+            if queued_for_node + len(clean_steps) > MAX_QUEUED_TASKS_PER_NODE:
+                raise LabError("node queue limit reached", code="queue_limit", status=429)
+            queued_playbooks = sum(
+                task["status"] == "queued"
+                and task["node_id"] == node_id
+                and task["type"] == "RUN_PLAYBOOK"
+                for task in self._tasks.values()
+            )
+            if queued_playbooks + len(clean_steps) > MAX_QUEUED_PLAYBOOKS_PER_NODE:
+                raise LabError(
+                    "purple-lab playbook queue limit reached",
+                    code="playbook_queue_limit",
+                    status=429,
+                )
+
+            if clean_idempotency_key is not None:
+                records_to_free = (
+                    len(self._operation_idempotency)
+                    + 1
+                    - MAX_OPERATION_IDEMPOTENCY_RECORDS
+                )
+                if records_to_free > 0:
+                    idempotency_eviction_keys = [
+                        key
+                        for key, record in self._operation_idempotency.items()
+                        if self._operation_idempotency_record_is_evictable_locked(record)
+                    ][:records_to_free]
+                    if len(idempotency_eviction_keys) < records_to_free:
+                        raise LabError(
+                            "operation idempotency retention limit reached",
+                            code="operation_idempotency_limit",
+                            status=429,
+                        )
+
+            self._make_task_slots_locked(len(clean_steps))
+            operation_id = f"operation-{uuid.uuid4().hex[:12]}"
+            created_tasks: list[dict[str, Any]] = []
+            for operation_step, payload in enumerate(clean_steps, start=1):
+                task_id = f"task-{uuid.uuid4().hex[:12]}"
+                task = {
+                    "id": task_id,
+                    "correlation_id": f"corr-{uuid.uuid4().hex[:12]}",
+                    "node_id": node_id,
+                    "type": "RUN_PLAYBOOK",
+                    "created_by": clean_actor,
+                    "payload": copy.deepcopy(payload),
+                    "status": "queued",
+                    "result": None,
+                    "created_at": utc_now(),
+                    "queue_ttl_seconds": clean_ttl,
+                    "dispatched_at": None,
+                    "completed_at": None,
+                    "delivery_attempts": 0,
+                    "operation_id": operation_id,
+                    "operation_step": operation_step,
+                    "_sequence": self._next_task_sequence_locked(),
+                    "_deadline": None,
+                    "_queue_deadline": instant + clean_ttl,
+                    "_idempotency_key": None,
+                    "_result_accepted": False,
+                }
+                self._tasks[task_id] = task
+                created_tasks.append(task)
+                self._record_locked(
+                    "task.queued",
+                    node_id=node_id,
+                    task_id=task_id,
+                    actor=clean_actor,
+                    data={"type": "RUN_PLAYBOOK", "correlation_id": task["correlation_id"]},
+                )
+                self._audit_locked(
+                    "task.queued",
+                    actor=clean_actor,
+                    node_id=node_id,
+                    task_id=task_id,
+                    correlation_id=task["correlation_id"],
+                    task_type="RUN_PLAYBOOK",
+                    to_state="queued",
+                    outcome="accepted",
+                    reason="operation_request",
+                )
+
+            task_ids = [task["id"] for task in created_tasks]
+            self._record_locked(
+                "operation.queued",
+                node_id=node_id,
+                correlation_id=operation_id,
+                actor=clean_actor,
+                data={
+                    "operation_id": operation_id,
+                    "step_count": len(clean_steps),
+                    "task_ids": task_ids,
+                },
+            )
+            self._audit_locked(
+                "operation.queued",
+                actor=clean_actor,
+                node_id=node_id,
+                correlation_id=operation_id,
+                to_state="queued",
+                outcome="accepted",
+                reason="bounded_playbook_operation",
+            )
+            summary = {
+                "id": operation_id,
+                "node_id": node_id,
+                "created_by": clean_actor,
+                "steps": copy.deepcopy(clean_steps),
+                "tasks": [self._public_task(task) for task in created_tasks],
+            }
+            if clean_idempotency_key is not None:
+                for key in idempotency_eviction_keys:
+                    del self._operation_idempotency[key]
+                self._operation_idempotency[clean_idempotency_key] = {
+                    "actor": clean_actor,
+                    "node_id": node_id,
+                    "playbooks": playbooks,
+                    "queue_ttl_seconds": clean_ttl,
+                    "task_ids": tuple(task_ids),
+                    "summary": copy.deepcopy(summary),
+                }
+            return summary
 
     def cancel_task(
         self,
@@ -1081,11 +1308,56 @@ class LabState:
             }
         )
 
+    def _append_exercise_task_evidence_locked(
+        self,
+        exercise: dict[str, Any],
+        task: dict[str, Any],
+    ) -> None:
+        """Retain terminal state and fixed ATT&CK IDs without retaining task results."""
+
+        playbook = task["payload"]["playbook"]
+        self._append_exercise_timeline_locked(
+            exercise,
+            phase="simulate",
+            kind=f"task.{task['status']}",
+            summary=f"{playbook} {task['status']}",
+            task_id=task["id"],
+        )
+        if task["status"] != "completed":
+            return
+        allowed_technique_ids = {
+            technique["id"]
+            for technique in scenario_definition(exercise["scenario_id"])["techniques"]
+        }
+        for technique in task["result"]["attack_techniques"]:
+            technique_id = technique["id"]
+            if technique_id not in allowed_technique_ids:
+                continue
+            self._append_exercise_timeline_locked(
+                exercise,
+                phase="simulate",
+                kind="technique.observed",
+                summary=f"{technique_id} observed",
+                task_id=task["id"],
+                technique_id=technique_id,
+            )
+
     def _refresh_exercises_locked(self) -> None:
         """Derive fixed alerts and terminal state from validated task records."""
 
         for exercise in self._exercises.values():
             if exercise["status"] == "contained":
+                # A task may already be dispatched when containment is applied.
+                # Preserve its eventual terminal state for the read model, but do
+                # not create new detections or replace the contained state.
+                for task_id in exercise["task_ids"]:
+                    if task_id in exercise["_observed_task_ids"]:
+                        continue
+                    task = self._tasks.get(task_id)
+                    if task is None or task["status"] not in TERMINAL_TASK_STATUSES:
+                        continue
+                    exercise["_observed_task_ids"].append(task_id)
+                    self._append_exercise_task_evidence_locked(exercise, task)
                 continue
             for task_id in exercise["task_ids"]:
                 if task_id in exercise["_observed_task_ids"]:
@@ -1095,13 +1367,7 @@ class LabState:
                     continue
                 exercise["_observed_task_ids"].append(task_id)
                 playbook = task["payload"]["playbook"]
-                self._append_exercise_timeline_locked(
-                    exercise,
-                    phase="simulate",
-                    kind=f"task.{task['status']}",
-                    summary=f"{playbook} {task['status']}",
-                    task_id=task_id,
-                )
+                self._append_exercise_task_evidence_locked(exercise, task)
                 if task["status"] != "completed":
                     continue
                 for rule in detections_for_playbook(exercise["scenario_id"], playbook):
@@ -1450,6 +1716,15 @@ class LabState:
                 task["result"] = {"reason": "exercise_contained"}
                 task["completed_at"] = utc_now()
                 task["_queue_deadline"] = None
+                playbook = task["payload"]["playbook"]
+                self._append_exercise_timeline_locked(
+                    exercise,
+                    phase="simulate",
+                    kind="task.cancelled",
+                    summary=f"{playbook} cancelled",
+                    task_id=task_id,
+                )
+                exercise["_observed_task_ids"].append(task_id)
                 self._record_locked(
                     "task.cancelled",
                     level="warning",
@@ -1568,6 +1843,7 @@ class LabState:
             self._events.clear()
             self._note_idempotency.clear()
             self._exercise_idempotency.clear()
+            self._operation_idempotency.clear()
             self._record_locked(
                 "lab.reset",
                 actor=clean_actor,
@@ -1928,7 +2204,8 @@ class LabState:
             {
                 key: value
                 for key, value in task.items()
-                if not key.startswith("_") and key != "created_by"
+                if not key.startswith("_")
+                and key not in {"created_by", "operation_id", "operation_step"}
             }
         )
 

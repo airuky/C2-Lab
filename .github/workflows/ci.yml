@@ -34,7 +34,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   javascript:
-    name: JavaScript syntax
+    name: JavaScript dashboard
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -49,3 +49,6 @@ jobs:
 
       - name: Check dashboard JavaScript syntax
         run: node --check c2lab/static/app.js
+
+      - name: Run dashboard JavaScript logic tests
+        run: node --test tests/test_dashboard_logic.mjs

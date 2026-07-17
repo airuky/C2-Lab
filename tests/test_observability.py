@@ -24,6 +24,7 @@ class ObservabilityTests(unittest.TestCase):
             "/lab/exercises/:exercise_id/contain",
         )
         self.assertEqual(normalized_route("/lab/sync"), "/lab/sync")
+        self.assertEqual(normalized_route("/lab/operations"), "/lab/operations")
         self.assertEqual(normalized_route("/lab/scenarios"), "/lab/scenarios")
         self.assertEqual(normalized_route("/lab/exercises"), "/lab/exercises")
         self.assertEqual(normalized_route("/lab/notes"), "/lab/notes")

@@ -435,7 +435,7 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 and parts[:2] == ["lab", "exercises"]
                 and parts[3] == "contain"
             )
-            if path == "/lab/tasks" or is_cancel:
+            if path in {"/lab/tasks", "/lab/operations"} or is_cancel:
                 permission = "task_write"
             elif path == "/lab/exercises":
                 permission = "exercise_write"
@@ -453,7 +453,14 @@ class LabRequestHandler(BaseHTTPRequestHandler):
             if session is None:
                 return
             if (
-                path not in {"/lab/tasks", "/lab/exercises", "/lab/notes", "/lab/reset"}
+                path
+                not in {
+                    "/lab/tasks",
+                    "/lab/operations",
+                    "/lab/exercises",
+                    "/lab/notes",
+                    "/lab/reset",
+                }
                 and not is_cancel
                 and not is_contain
                 and not is_revoke
@@ -487,6 +494,26 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                     **queue_options,
                 )
                 self._send_json(HTTPStatus.CREATED, task)
+                return
+            if path == "/lab/operations":
+                self._require_body_keys(
+                    body,
+                    required={"node_id", "steps"},
+                    optional={"queue_ttl_seconds"},
+                )
+                queue_options = (
+                    {"queue_ttl_seconds": body["queue_ttl_seconds"]}
+                    if "queue_ttl_seconds" in body
+                    else {}
+                )
+                operation = self.server.lab_state.queue_operation(
+                    body["node_id"],
+                    body["steps"],
+                    idempotency_key=self._read_idempotency_key(),
+                    actor=session["principal_id"],
+                    **queue_options,
+                )
+                self._send_json(HTTPStatus.CREATED, operation)
                 return
             if path == "/lab/notes":
                 self._require_body_keys(body, required={"message"})

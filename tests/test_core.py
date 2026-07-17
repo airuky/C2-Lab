@@ -1217,5 +1217,349 @@ class LabStateTests(unittest.TestCase):
         self.assertEqual(prune_audit["reason"], "terminal_task_retention_limit")
 
 
+class OperationBuilderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = LabState()
+        enrollment = self.state.enroll_node(
+            "operation-node",
+            "0.8.0",
+            "purple_lab",
+            capabilities_for_profile("purple_lab"),
+            500,
+            now=10.0,
+        )
+        self.node = enrollment["node"]
+        self.session_token = enrollment["session_token"]
+
+    @staticmethod
+    def steps(*playbooks: str) -> list[dict[str, str]]:
+        return [{"playbook": playbook} for playbook in playbooks]
+
+    def test_operation_atomically_queues_ordered_public_playbook_tasks(self) -> None:
+        steps = self.steps("DISCOVERY_FIXTURES", "COLLECT_AND_STAGE", "CREATE_CANARY")
+        operation = self.state.queue_operation(
+            self.node["id"],
+            steps,
+            queue_ttl_seconds=60,
+            actor="operator-alpha",
+            now=20.0,
+        )
+
+        self.assertEqual(
+            set(operation),
+            {"id", "node_id", "created_by", "steps", "tasks"},
+        )
+        self.assertTrue(operation["id"].startswith("operation-"))
+        self.assertEqual(operation["node_id"], self.node["id"])
+        self.assertEqual(operation["created_by"], "operator-alpha")
+        self.assertEqual(operation["steps"], steps)
+        self.assertEqual(len(operation["tasks"]), 3)
+        for position, (task, step) in enumerate(
+            zip(operation["tasks"], steps, strict=True),
+            start=1,
+        ):
+            self.assertEqual(task["operation_id"], operation["id"])
+            self.assertEqual(task["operation_step"], position)
+            self.assertEqual(task["type"], "RUN_PLAYBOOK")
+            self.assertEqual(task["payload"], step)
+            self.assertEqual(task["queue_ttl_seconds"], 60)
+            self.assertEqual(task["created_by"], "operator-alpha")
+
+        persisted = sorted(
+            self.state.tasks(),
+            key=lambda task: task["operation_step"],
+        )
+        self.assertEqual(
+            [task["id"] for task in persisted],
+            [task["id"] for task in operation["tasks"]],
+        )
+        first_poll = self.state.poll_node(self.node["id"], self.session_token, now=20.1)
+        self.assertEqual(first_poll["task"]["payload"], steps[0])
+        self.assertNotIn("operation_id", first_poll["task"])
+        self.assertNotIn("operation_step", first_poll["task"])
+
+        operation_event = next(
+            event for event in self.state.events() if event["kind"] == "operation.queued"
+        )
+        self.assertEqual(operation_event["correlation_id"], operation["id"])
+        self.assertEqual(
+            operation_event["data"],
+            {
+                "operation_id": operation["id"],
+                "step_count": 3,
+                "task_ids": [task["id"] for task in operation["tasks"]],
+            },
+        )
+        operation_audit = next(
+            entry for entry in self.state.audit() if entry["action"] == "operation.queued"
+        )
+        self.assertEqual(operation_audit["actor"], "operator-alpha")
+        self.assertEqual(operation_audit["correlation_id"], operation["id"])
+        self.assertEqual(operation_audit["reason"], "bounded_playbook_operation")
+        self.assertNotIn("payload", operation_event)
+        self.assertNotIn("payload", operation_audit)
+
+    def test_operation_validation_is_exact_bounded_and_non_mutating(self) -> None:
+        baseline_tasks = self.state.tasks()
+        baseline_events = self.state.events()
+        baseline_audit = self.state.audit()
+        invalid_steps = (
+            None,
+            {},
+            (),
+            [],
+            self.steps(
+                "DISCOVERY_FIXTURES",
+                "COLLECT_AND_STAGE",
+                "CREATE_CANARY",
+                "CLEANUP",
+            ),
+            [{}],
+            [{"playbook": "DISCOVERY_FIXTURES", "command": "ignored"}],
+            [{"playbook": "UNKNOWN"}],
+            [{"playbook": 1}],
+        )
+
+        for invalid in invalid_steps:
+            with self.subTest(steps=invalid), self.assertRaises(LabError):
+                self.state.queue_operation(self.node["id"], invalid)
+        for invalid_ttl in (None, False, 4, 86_401):
+            with self.subTest(queue_ttl_seconds=invalid_ttl), self.assertRaises(LabError):
+                self.state.queue_operation(
+                    self.node["id"],
+                    self.steps("DISCOVERY_FIXTURES"),
+                    queue_ttl_seconds=invalid_ttl,
+                )
+
+        self.assertEqual(self.state.tasks(), baseline_tasks)
+        self.assertEqual(self.state.events(), baseline_events)
+        self.assertEqual(self.state.audit(), baseline_audit)
+
+    def test_operation_requires_online_active_unpaused_purple_node(self) -> None:
+        training = self.state.enroll_node(
+            "training-node",
+            "0.8.0",
+            "training",
+            capabilities_for_profile("training"),
+            500,
+        )
+        with self.assertRaises(LabError) as profile_error:
+            self.state.queue_operation(
+                training["node"]["id"], self.steps("DISCOVERY_FIXTURES")
+            )
+        self.assertEqual(profile_error.exception.code, "capability_denied")
+
+        self.state._nodes[self.node["id"]]["status"] = "offline"
+        with self.assertRaises(LabError) as offline_error:
+            self.state.queue_operation(
+                self.node["id"], self.steps("DISCOVERY_FIXTURES")
+            )
+        self.assertEqual(offline_error.exception.code, "node_offline")
+
+        self.state._nodes[self.node["id"]]["status"] = "online"
+        self.state._nodes[self.node["id"]]["tasking_paused"] = True
+        with self.assertRaises(LabError) as paused_error:
+            self.state.queue_operation(
+                self.node["id"], self.steps("DISCOVERY_FIXTURES")
+            )
+        self.assertEqual(paused_error.exception.code, "node_tasking_paused")
+
+        self.state._nodes[self.node["id"]]["tasking_paused"] = False
+        self.state.disconnect_node(self.node["id"], self.session_token)
+        with self.assertRaises(LabError) as disconnected_error:
+            self.state.queue_operation(
+                self.node["id"], self.steps("DISCOVERY_FIXTURES")
+            )
+        self.assertEqual(disconnected_error.exception.code, "node_disconnected")
+        self.assertEqual(self.state.tasks(), [])
+
+    def test_operation_idempotency_binds_actor_node_order_steps_and_ttl(self) -> None:
+        key = "operation-request-0001"
+        steps = self.steps("DISCOVERY_FIXTURES", "COLLECT_AND_STAGE")
+        first = self.state.queue_operation(
+            self.node["id"],
+            steps,
+            queue_ttl_seconds=60,
+            idempotency_key=key,
+            actor="operator-alpha",
+        )
+        replay = self.state.queue_operation(
+            self.node["id"],
+            steps,
+            queue_ttl_seconds=60,
+            idempotency_key=key,
+            actor="operator-alpha",
+        )
+
+        self.assertEqual(replay, first)
+        self.assertEqual(len(self.state.tasks()), 2)
+        self.assertEqual(
+            len([event for event in self.state.events() if event["kind"] == "operation.queued"]),
+            1,
+        )
+        conflicts = (
+            {
+                "steps": list(reversed(steps)),
+                "queue_ttl_seconds": 60,
+                "actor": "operator-alpha",
+            },
+            {
+                "steps": steps,
+                "queue_ttl_seconds": 61,
+                "actor": "operator-alpha",
+            },
+            {
+                "steps": steps,
+                "queue_ttl_seconds": 60,
+                "actor": "operator-beta",
+            },
+        )
+        for request in conflicts:
+            with self.subTest(request=request), self.assertRaises(LabError) as conflict:
+                self.state.queue_operation(
+                    self.node["id"],
+                    request["steps"],
+                    queue_ttl_seconds=request["queue_ttl_seconds"],
+                    idempotency_key=key,
+                    actor=request["actor"],
+                )
+            self.assertEqual(conflict.exception.code, "idempotency_conflict")
+            self.assertEqual(conflict.exception.status, 409)
+        self.assertEqual(len(self.state.tasks()), 2)
+
+    def test_operation_idempotency_pressure_keeps_live_operation_replayable(self) -> None:
+        steps = self.steps("DISCOVERY_FIXTURES")
+        first_key = "operation-pressure-a"
+        second_key = "operation-pressure-b"
+        third_key = "operation-pressure-c"
+
+        with patch("c2lab.core.MAX_OPERATION_IDEMPOTENCY_RECORDS", 2):
+            first = self.state.queue_operation(
+                self.node["id"],
+                steps,
+                idempotency_key=first_key,
+                now=20.0,
+            )
+            dispatched = self.state.poll_node(
+                self.node["id"],
+                self.session_token,
+                now=20.1,
+            )["task"]
+            self.assertEqual(dispatched["id"], first["tasks"][0]["id"])
+
+            second = self.state.queue_operation(
+                self.node["id"],
+                steps,
+                idempotency_key=second_key,
+                now=20.2,
+            )
+            tasks_before_rejection = self.state.tasks()
+            operation_events_before_rejection = sum(
+                event["kind"] == "operation.queued" for event in self.state.events()
+            )
+            with self.assertRaises(LabError) as limit_error:
+                self.state.queue_operation(
+                    self.node["id"],
+                    steps,
+                    idempotency_key=third_key,
+                    now=20.3,
+                )
+            self.assertEqual(limit_error.exception.code, "operation_idempotency_limit")
+            self.assertEqual(limit_error.exception.status, 429)
+            self.assertEqual(self.state.tasks(), tasks_before_rejection)
+            self.assertEqual(
+                sum(event["kind"] == "operation.queued" for event in self.state.events()),
+                operation_events_before_rejection,
+            )
+
+            self.state.cancel_task(second["tasks"][0]["id"])
+            third = self.state.queue_operation(
+                self.node["id"],
+                steps,
+                idempotency_key=third_key,
+                now=20.4,
+            )
+            replay = self.state.queue_operation(
+                self.node["id"],
+                steps,
+                idempotency_key=first_key,
+                now=20.5,
+            )
+
+        self.assertEqual(replay, first)
+        self.assertIn(first_key, self.state._operation_idempotency)
+        self.assertNotIn(second_key, self.state._operation_idempotency)
+        self.assertIn(third_key, self.state._operation_idempotency)
+        self.assertEqual(
+            self.state._operation_idempotency[first_key]["task_ids"],
+            (first["tasks"][0]["id"],),
+        )
+        self.assertEqual(
+            [
+                task["operation_id"]
+                for task in self.state.tasks()
+                if task["status"] in {"queued", "dispatched"}
+            ],
+            [third["id"], first["id"]],
+        )
+
+    def test_operation_queue_limits_reject_without_partial_tasks(self) -> None:
+        steps = self.steps("DISCOVERY_FIXTURES", "COLLECT_AND_STAGE", "CREATE_CANARY")
+        scenarios = (
+            ("per-node task", 2, 10, 10, "queue_limit"),
+            ("per-node playbook", 10, 2, 10, "playbook_queue_limit"),
+            ("total task", 10, 10, 2, "task_limit"),
+        )
+        for label, task_limit, playbook_limit, total_limit, expected in scenarios:
+            with self.subTest(limit=label):
+                state = LabState()
+                node = state.enroll_node(
+                    f"limit-{label}",
+                    "0.8.0",
+                    "purple_lab",
+                    capabilities_for_profile("purple_lab"),
+                    500,
+                )["node"]
+                with (
+                    patch("c2lab.core.MAX_QUEUED_TASKS_PER_NODE", task_limit),
+                    patch("c2lab.core.MAX_QUEUED_PLAYBOOKS_PER_NODE", playbook_limit),
+                    patch("c2lab.core.MAX_TASKS", total_limit),
+                    self.assertRaises(LabError) as context,
+                ):
+                    state.queue_operation(node["id"], steps)
+                self.assertEqual(context.exception.code, expected)
+                self.assertEqual(state.tasks(), [])
+                self.assertFalse(
+                    any(event["kind"] == "operation.queued" for event in state.events())
+                )
+
+    def test_reset_clears_operation_idempotency(self) -> None:
+        key = "operation-reset-0001"
+        self.state.queue_operation(
+            self.node["id"],
+            self.steps("DISCOVERY_FIXTURES"),
+            idempotency_key=key,
+        )
+        self.assertIn(key, self.state._operation_idempotency)
+
+        self.state.reset(actor="admin-user")
+
+        self.assertEqual(self.state._operation_idempotency, {})
+        replacement = self.state.enroll_node(
+            "replacement-operation-node",
+            "0.8.0",
+            "purple_lab",
+            capabilities_for_profile("purple_lab"),
+            500,
+        )["node"]
+        operation = self.state.queue_operation(
+            replacement["id"],
+            self.steps("CLEANUP"),
+            idempotency_key=key,
+        )
+        self.assertEqual(operation["node_id"], replacement["id"])
+        self.assertEqual(len(self.state.tasks()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

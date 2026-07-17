@@ -23,6 +23,7 @@ _EXACT_ROUTES = frozenset(
         "/lab/overview",
         "/lab/nodes",
         "/lab/tasks",
+        "/lab/operations",
         "/lab/scenarios",
         "/lab/exercises",
         "/lab/notes",
